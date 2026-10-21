@@ -1,0 +1,5 @@
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE SCHEMA IF NOT EXISTS app;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA extensions;
+SET search_path TO app, extensions, public;
