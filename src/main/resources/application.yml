@@ -52,3 +52,8 @@ logging:
   structured:
     format:
       console: logstash
+
+vistay:
+  security:
+    issuer: ${VISTAY_JWT_ISSUER:https://auth.vistay.internal}
+    jwt-secret: ${VISTAY_JWT_SECRET:local-development-secret-change-before-production-32}
