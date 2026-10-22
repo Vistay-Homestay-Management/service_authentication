@@ -64,13 +64,14 @@ public class AuthService {
             return previous.account();
         }
 
-        var identityAccountId = deterministicAccountId(normalizedKey);
+        var provisioningReference = deterministicAccountId(normalizedKey);
         var subject = keycloak.ensureBackofficeUser(
             normalizedEmail,
             normalizedName,
             temporaryPassword,
-            identityAccountId
+            provisioningReference
         );
+        var identityAccountId = keycloakSubject(subject);
 
         try {
             return transactions.execute(status -> persistProvisioning(
@@ -199,6 +200,14 @@ public class AuthService {
     private static UUID deterministicAccountId(String idempotencyKey) {
         return UUID.nameUUIDFromBytes(("vistay:backoffice:" + idempotencyKey)
             .getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static UUID keycloakSubject(String subject) {
+        try {
+            return UUID.fromString(subject);
+        } catch (IllegalArgumentException invalid) {
+            throw new IllegalStateException("Keycloak user subject must be a UUID", invalid);
+        }
     }
 
     private static String normalizeCorrelationId(String value) {
