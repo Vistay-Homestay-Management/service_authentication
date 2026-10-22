@@ -52,8 +52,8 @@ public class KeycloakAdminClient {
             name.firstName(),
             name.lastName(),
             true,
-            false,
-            List.of("VERIFY_EMAIL"),
+            true,
+            List.of("UPDATE_PASSWORD"),
             List.of(new CredentialRepresentation("password", temporaryPassword, true)),
             Map.of(
                 "vistay_account_type", List.of("ADMIN"),
