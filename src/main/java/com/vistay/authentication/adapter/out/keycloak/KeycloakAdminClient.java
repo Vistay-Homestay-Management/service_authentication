@@ -38,7 +38,7 @@ public class KeycloakAdminClient {
         String email,
         String fullName,
         String temporaryPassword,
-        UUID identityAccountId
+        UUID provisioningReference
     ) {
         var existing = findExactByEmail(email);
         if (existing != null) {
@@ -57,7 +57,7 @@ public class KeycloakAdminClient {
             List.of(new CredentialRepresentation("password", temporaryPassword, true)),
             Map.of(
                 "vistay_account_type", List.of("ADMIN"),
-                "vistay_identity_account_id", List.of(identityAccountId.toString())
+                "vistay_provisioning_reference", List.of(provisioningReference.toString())
             )
         );
 

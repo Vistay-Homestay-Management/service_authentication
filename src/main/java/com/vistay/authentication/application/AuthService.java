@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.HexFormat;
 import java.util.Locale;
 import java.util.UUID;
@@ -134,7 +135,7 @@ public class AuthService {
             .update();
 
         var data = writeJson(new AccountProvisionedData(
-            persisted.id(), persisted.subject(), persisted.email(), fullName, persisted.accountType()
+            persisted.id(), "BACKOFFICE", persisted.email(), fullName, OffsetDateTime.now(ZoneOffset.UTC)
         ));
         jdbc.sql("""
             INSERT INTO outbox_events(
@@ -146,7 +147,7 @@ public class AuthService {
             )
             """)
             .param("aggregateId", persisted.id())
-            .param("aggregateVersion", persisted.version())
+            .param("aggregateVersion", persisted.version() + 1)
             .param("eventType", BACKOFFICE_ACCOUNT_PROVISIONED)
             .param("payload", data)
             .param("correlationId", normalizeCorrelationId(correlationId))
@@ -214,7 +215,14 @@ public class AuthService {
         if (value == null || value.isBlank()) {
             return UUID.randomUUID().toString();
         }
-        return value.length() <= 100 ? value : value.substring(0, 100);
+        try {
+            return UUID.fromString(value.trim()).toString();
+        } catch (IllegalArgumentException invalid) {
+            throw new ResponseStatusException(
+                HttpStatus.BAD_REQUEST,
+                "X-Correlation-Id must be a UUID"
+            );
+        }
     }
 
     private static String sha256(String value) {
@@ -230,11 +238,11 @@ public class AuthService {
     private record PreviousProvisioning(String requestHash, ProvisionedAccount account) {}
 
     private record AccountProvisionedData(
-        UUID identityAccountId,
-        String subject,
+        UUID accountId,
+        String realm,
         String email,
-        String fullName,
-        String accountType
+        String displayName,
+        OffsetDateTime provisionedAt
     ) {}
 
     public record ProvisionedAccount(
