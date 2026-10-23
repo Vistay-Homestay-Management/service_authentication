@@ -35,6 +35,8 @@ spring:
       ssl.truststore.password: ${KAFKA_TRUSTSTORE_PASSWORD:}
     producer:
       acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
       properties:
         enable.idempotence: true
     consumer:
@@ -46,6 +48,12 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:}
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_BACKOFFICE_ISSUER:http://localhost:8180/realms/vistay-backoffice}
+          jwk-set-uri: ${KEYCLOAK_BACKOFFICE_JWKS_URI:http://localhost:8180/realms/vistay-backoffice/protocol/openid-connect/certs}
 
 server:
   port: ${SERVER_PORT:8080}
@@ -69,5 +77,14 @@ logging:
 
 vistay:
   security:
-    issuer: ${VISTAY_JWT_ISSUER:https://auth.vistay.internal}
-    jwt-secret: ${VISTAY_JWT_SECRET:local-development-secret-change-before-production-32}
+    audience: ${KEYCLOAK_BACKOFFICE_AUDIENCE:vistay-backoffice-api}
+  bootstrap:
+    token: ${VISTAY_BOOTSTRAP_TOKEN:local-bootstrap-token-change-before-use-1234567890}
+  keycloak:
+    base-url: ${KEYCLOAK_BASE_URL:http://localhost:8180}
+    backoffice-realm: ${KEYCLOAK_BACKOFFICE_REALM:vistay-backoffice}
+    admin-client-id: ${KEYCLOAK_ADMIN_CLIENT_ID:vistay-auth-facade}
+    admin-client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:local-keycloak-client-secret}
+  outbox:
+    poll-delay-ms: ${OUTBOX_POLL_DELAY_MS:1000}
+    send-timeout-seconds: ${OUTBOX_SEND_TIMEOUT_SECONDS:10}

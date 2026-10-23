@@ -1,265 +1,257 @@
 package com.vistay.authentication.application;
 
+import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
-import java.time.Duration;
-import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.util.Base64;
+import java.util.HexFormat;
 import java.util.Locale;
 import java.util.UUID;
-
-import com.vistay.authentication.domain.AccountType;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
-import org.springframework.security.oauth2.jwt.JwtClaimsSet;
-import org.springframework.security.oauth2.jwt.JwtEncoder;
-import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
-import org.springframework.security.oauth2.jwt.JwsHeader;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
 
 @Service
 public class AuthService {
-    private static final Duration ACCESS_LIFETIME = Duration.ofMinutes(15);
-    private static final Duration REFRESH_IDLE_LIFETIME = Duration.ofDays(7);
-    private static final Duration REFRESH_ABSOLUTE_LIFETIME = Duration.ofDays(30);
-    private static final SecureRandom RANDOM = new SecureRandom();
+    public static final String BACKOFFICE_ACCOUNT_PROVISIONED = "vistay.auth.account-provisioned";
 
     private final JdbcClient jdbc;
-    private final PasswordEncoder passwords;
-    private final JwtEncoder jwtEncoder;
-    private final StringRedisTemplate redis;
-    private final String issuer;
+    private final KeycloakAdminClient keycloak;
+    private final ObjectMapper json;
+    private final TransactionTemplate transactions;
 
     public AuthService(
         JdbcClient jdbc,
-        PasswordEncoder passwords,
-        JwtEncoder jwtEncoder,
-        StringRedisTemplate redis,
-        @Value("${vistay.security.issuer}") String issuer
+        KeycloakAdminClient keycloak,
+        ObjectMapper json,
+        TransactionTemplate transactions
     ) {
         this.jdbc = jdbc;
-        this.passwords = passwords;
-        this.jwtEncoder = jwtEncoder;
-        this.redis = redis;
-        this.issuer = issuer;
+        this.keycloak = keycloak;
+        this.json = json;
+        this.transactions = transactions;
     }
 
-    @Transactional
-    public UUID registerCustomer(String email, String rawPassword) {
-        var normalizedEmail = normalizeIdentifier(email);
-        validatePassword(rawPassword);
+    public ProvisionedAccount bootstrapBackoffice(
+        String idempotencyKey,
+        String email,
+        String fullName,
+        String temporaryPassword,
+        String correlationId
+    ) {
+        var normalizedKey = requireIdempotencyKey(idempotencyKey);
+        var normalizedEmail = email.trim().toLowerCase(Locale.ROOT);
+        var normalizedName = fullName.trim();
+        var requestHash = sha256(normalizedEmail + "\n" + normalizedName);
+
+        var previous = findByIdempotencyKey(normalizedKey);
+        if (previous != null) {
+            if (!MessageDigest.isEqual(
+                previous.requestHash().getBytes(StandardCharsets.US_ASCII),
+                requestHash.getBytes(StandardCharsets.US_ASCII)
+            )) {
+                throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "Idempotency-Key was already used with different account data"
+                );
+            }
+            return previous.account();
+        }
+
+        var provisioningReference = deterministicAccountId(normalizedKey);
+        var subject = keycloak.ensureBackofficeUser(
+            normalizedEmail,
+            normalizedName,
+            temporaryPassword,
+            provisioningReference
+        );
+        var identityAccountId = keycloakSubject(subject);
+
         try {
-            return jdbc.sql("""
-                INSERT INTO customer_accounts(email, password_hash, status, email_verified_at)
-                VALUES (:email, :passwordHash, 'ACTIVE', now())
-                RETURNING id
-                """)
-                .param("email", normalizedEmail)
-                .param("passwordHash", passwords.encode(rawPassword))
-                .query(UUID.class)
-                .single();
-        } catch (DataIntegrityViolationException duplicate) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Customer account already exists");
+            return transactions.execute(status -> persistProvisioning(
+                normalizedKey,
+                requestHash,
+                identityAccountId,
+                subject,
+                normalizedEmail,
+                normalizedName,
+                correlationId
+            ));
+        } catch (DataIntegrityViolationException concurrentRequest) {
+            var winner = findByIdempotencyKey(normalizedKey);
+            if (winner != null && MessageDigest.isEqual(
+                winner.requestHash().getBytes(StandardCharsets.US_ASCII),
+                requestHash.getBytes(StandardCharsets.US_ASCII)
+            )) {
+                return winner.account();
+            }
+            throw concurrentRequest;
         }
     }
 
-    @Transactional
-    public TokenPair login(AccountType type, String identifier, String rawPassword, String clientId) {
-        var account = findAccount(type, normalizeIdentifier(identifier));
-        if (account == null || !passwords.matches(rawPassword, account.passwordHash())) {
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid credentials");
-        }
-        if (!"ACTIVE".equals(account.status())) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Account is not active");
-        }
-
-        var now = Instant.now();
-        var sessionId = UUID.randomUUID();
-        var refreshToken = newRefreshToken(sessionId);
+    private ProvisionedAccount persistProvisioning(
+        String idempotencyKey,
+        String requestHash,
+        UUID identityAccountId,
+        String subject,
+        String email,
+        String fullName,
+        String correlationId
+    ) {
         jdbc.sql("""
-            INSERT INTO auth_sessions(
-                id, account_type, account_id, client_id, refresh_token_hash,
-                token_family_id, idle_expires_at, absolute_expires_at
+            INSERT INTO identity_accounts(id, realm, subject, account_type, email, status)
+            VALUES (:id, 'vistay-backoffice', :subject, 'ADMIN', :email, 'ACTIVE')
+            ON CONFLICT (realm, subject) DO UPDATE
+            SET email = EXCLUDED.email, updated_at = now()
+            """)
+            .param("id", identityAccountId)
+            .param("subject", subject)
+            .param("email", email)
+            .update();
+
+        var persisted = jdbc.sql("""
+            SELECT id, subject, email, account_type, status, version, created_at
+            FROM identity_accounts
+            WHERE realm = 'vistay-backoffice' AND subject = :subject
+            """)
+            .param("subject", subject)
+            .query(ProvisionedAccount.class)
+            .single();
+
+        jdbc.sql("""
+            INSERT INTO provisioning_requests(idempotency_key, request_hash, identity_account_id, completed_at)
+            VALUES (:key, :requestHash, :accountId, now())
+            """)
+            .param("key", idempotencyKey)
+            .param("requestHash", requestHash)
+            .param("accountId", persisted.id())
+            .update();
+
+        var data = writeJson(new AccountProvisionedData(
+            persisted.id(), "BACKOFFICE", persisted.email(), fullName, OffsetDateTime.now(ZoneOffset.UTC)
+        ));
+        jdbc.sql("""
+            INSERT INTO outbox_events(
+                aggregate_type, aggregate_id, aggregate_version, event_type,
+                event_version, payload, correlation_id
             ) VALUES (
-                :id, :accountType, :accountId, :clientId, :refreshHash,
-                :familyId, :idleExpiresAt, :absoluteExpiresAt
+                'IdentityAccount', :aggregateId, :aggregateVersion, :eventType,
+                1, CAST(:payload AS jsonb), :correlationId
             )
             """)
-            .param("id", sessionId)
-            .param("accountType", type.name())
-            .param("accountId", account.id())
-            .param("clientId", clientId)
-            .param("refreshHash", sha256(refreshToken))
-            .param("familyId", UUID.randomUUID())
-            .param("idleExpiresAt", atUtc(now.plus(REFRESH_IDLE_LIFETIME)))
-            .param("absoluteExpiresAt", atUtc(now.plus(REFRESH_ABSOLUTE_LIFETIME)))
+            .param("aggregateId", persisted.id())
+            .param("aggregateVersion", persisted.version() + 1)
+            .param("eventType", BACKOFFICE_ACCOUNT_PROVISIONED)
+            .param("payload", data)
+            .param("correlationId", normalizeCorrelationId(correlationId))
             .update();
-        jdbc.sql("UPDATE " + type.tableName() + " SET last_login_at = now(), failed_login_attempts = 0 WHERE id = :id")
-            .param("id", account.id())
-            .update();
-        return issuePair(account, type, sessionId, refreshToken, now);
+        return persisted;
     }
 
-    @Transactional
-    public TokenPair refresh(String presentedToken, String clientId) {
-        var sessionId = parseSessionId(presentedToken);
-        var session = jdbc.sql("""
-            SELECT id, account_type, account_id, client_id, refresh_token_hash,
-                   idle_expires_at, absolute_expires_at, revoked_at
-            FROM auth_sessions WHERE id = :id FOR UPDATE
-            """)
-            .param("id", sessionId)
-            .query(SessionRow.class)
-            .optional()
-            .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid refresh token"));
-
-        if (!MessageDigest.isEqual(
-            session.refreshTokenHash().getBytes(StandardCharsets.US_ASCII),
-            sha256(presentedToken).getBytes(StandardCharsets.US_ASCII)
-        )) {
-            revokeSession(session.id(), "REFRESH_TOKEN_REPLAY");
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Refresh token replay detected");
-        }
-
-        var now = Instant.now();
-        if (session.revokedAt() != null || !session.clientId().equals(clientId)
-            || session.idleExpiresAt().toInstant().isBefore(now)
-            || session.absoluteExpiresAt().toInstant().isBefore(now)) {
-            revokeSession(session.id(), "REFRESH_TOKEN_EXPIRED_OR_INVALID");
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Refresh session expired");
-        }
-
-        var type = AccountType.valueOf(session.accountType());
-        var account = findAccountById(type, session.accountId());
-        if (account == null || !"ACTIVE".equals(account.status())) {
-            revokeSession(session.id(), "ACCOUNT_INACTIVE");
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Account is not active");
-        }
-
-        var rotated = newRefreshToken(session.id());
-        var idleExpiry = atUtc(min(now.plus(REFRESH_IDLE_LIFETIME), session.absoluteExpiresAt().toInstant()));
-        jdbc.sql("""
-            UPDATE auth_sessions
-            SET refresh_token_hash = :hash, last_seen_at = now(), idle_expires_at = :idleExpiry
-            WHERE id = :id
-            """)
-            .param("hash", sha256(rotated))
-            .param("idleExpiry", idleExpiry)
-            .param("id", session.id())
-            .update();
-        return issuePair(account, type, session.id(), rotated, now);
-    }
-
-    @Transactional
-    public void logout(UUID sessionId, String accessTokenId, Instant accessExpiry) {
-        revokeSession(sessionId, "LOGOUT");
-        var ttl = Duration.between(Instant.now(), accessExpiry);
-        if (!ttl.isNegative() && !ttl.isZero()) {
-            redis.opsForValue().set("auth:revoked:jti:" + accessTokenId, "1", ttl);
-        }
-    }
-
-    private AccountRow findAccount(AccountType type, String identifier) {
+    private PreviousProvisioning findByIdempotencyKey(String key) {
         return jdbc.sql("""
-            SELECT id, password_hash, status, security_version
-            FROM %s
-            WHERE lower(email::text) = :identifier OR normalized_phone = :identifier
-            """.formatted(type.tableName()))
-            .param("identifier", identifier)
-            .query(AccountRow.class)
+            SELECT pr.request_hash, ia.id, ia.subject, ia.email, ia.account_type,
+                   ia.status, ia.version, ia.created_at
+            FROM provisioning_requests pr
+            JOIN identity_accounts ia ON ia.id = pr.identity_account_id
+            WHERE pr.idempotency_key = :key AND pr.completed_at IS NOT NULL
+            """)
+            .param("key", key)
+            .query((rs, rowNum) -> new PreviousProvisioning(
+                rs.getString("request_hash"),
+                new ProvisionedAccount(
+                    rs.getObject("id", UUID.class),
+                    rs.getString("subject"),
+                    rs.getString("email"),
+                    rs.getString("account_type"),
+                    rs.getString("status"),
+                    rs.getLong("version"),
+                    rs.getObject("created_at", OffsetDateTime.class)
+                )
+            ))
             .optional()
             .orElse(null);
     }
 
-    private AccountRow findAccountById(AccountType type, UUID id) {
-        return jdbc.sql("""
-            SELECT id, password_hash, status, security_version
-            FROM %s WHERE id = :id
-            """.formatted(type.tableName()))
-            .param("id", id)
-            .query(AccountRow.class)
-            .optional()
-            .orElse(null);
-    }
-
-    private TokenPair issuePair(AccountRow account, AccountType type, UUID sessionId, String refreshToken, Instant now) {
-        var claims = JwtClaimsSet.builder()
-            .issuer(issuer).issuedAt(now).expiresAt(now.plus(ACCESS_LIFETIME))
-            .subject(account.id().toString()).id(UUID.randomUUID().toString())
-            .claim("account_type", type.name())
-            .claim("session_id", sessionId.toString())
-            .claim("security_version", account.securityVersion())
-            .build();
-        var header = JwsHeader.with(MacAlgorithm.HS256).type("JWT").build();
-        var access = jwtEncoder.encode(JwtEncoderParameters.from(header, claims)).getTokenValue();
-        return new TokenPair(access, refreshToken, ACCESS_LIFETIME.toSeconds(), "Bearer");
-    }
-
-    private void revokeSession(UUID sessionId, String reason) {
-        jdbc.sql("""
-            UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, now()),
-                revocation_reason = COALESCE(revocation_reason, :reason)
-            WHERE id = :id
-            """)
-            .param("reason", reason).param("id", sessionId).update();
-        redis.opsForValue().set("auth:revoked:session:" + sessionId, "1", REFRESH_ABSOLUTE_LIFETIME);
-    }
-
-    private static UUID parseSessionId(String refreshToken) {
+    private String writeJson(Object value) {
         try {
-            return UUID.fromString(refreshToken.substring(0, refreshToken.indexOf('.')));
-        } catch (RuntimeException invalid) {
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid refresh token");
+            return json.writeValueAsString(value);
+        } catch (JacksonException failure) {
+            throw new IllegalStateException("Cannot serialize account provisioning event", failure);
         }
     }
 
-    private static String newRefreshToken(UUID sessionId) {
-        var secret = new byte[48];
-        RANDOM.nextBytes(secret);
-        return sessionId + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
+    private static String requireIdempotencyKey(String value) {
+        if (value == null || value.isBlank() || value.length() > 120) {
+            throw new ResponseStatusException(
+                HttpStatus.BAD_REQUEST,
+                "Idempotency-Key is required and must not exceed 120 characters"
+            );
+        }
+        return value.trim();
     }
 
-    private static String normalizeIdentifier(String value) {
-        return value.trim().toLowerCase(Locale.ROOT);
+    private static UUID deterministicAccountId(String idempotencyKey) {
+        return UUID.nameUUIDFromBytes(("vistay:backoffice:" + idempotencyKey)
+            .getBytes(StandardCharsets.UTF_8));
     }
 
-    private static void validatePassword(String password) {
-        if (password == null || password.length() < 12 || password.length() > 128) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Password must contain 12 to 128 characters");
+    private static UUID keycloakSubject(String subject) {
+        try {
+            return UUID.fromString(subject);
+        } catch (IllegalArgumentException invalid) {
+            throw new IllegalStateException("Keycloak user subject must be a UUID", invalid);
+        }
+    }
+
+    private static String normalizeCorrelationId(String value) {
+        if (value == null || value.isBlank()) {
+            return UUID.randomUUID().toString();
+        }
+        try {
+            return UUID.fromString(value.trim()).toString();
+        } catch (IllegalArgumentException invalid) {
+            throw new ResponseStatusException(
+                HttpStatus.BAD_REQUEST,
+                "X-Correlation-Id must be a UUID"
+            );
         }
     }
 
     private static String sha256(String value) {
         try {
-            var digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-            return java.util.HexFormat.of().formatHex(digest);
+            return HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))
+            );
         } catch (NoSuchAlgorithmException impossible) {
             throw new IllegalStateException(impossible);
         }
     }
 
-    private static OffsetDateTime atUtc(Instant value) {
-        return value.atOffset(ZoneOffset.UTC);
-    }
+    private record PreviousProvisioning(String requestHash, ProvisionedAccount account) {}
 
-    private static Instant min(Instant first, Instant second) {
-        return first.isBefore(second) ? first : second;
-    }
+    private record AccountProvisionedData(
+        UUID accountId,
+        String realm,
+        String email,
+        String displayName,
+        OffsetDateTime provisionedAt
+    ) {}
 
-    private record AccountRow(UUID id, String passwordHash, String status, long securityVersion) {}
-    private record SessionRow(UUID id, String accountType, UUID accountId, String clientId,
-        String refreshTokenHash, OffsetDateTime idleExpiresAt, OffsetDateTime absoluteExpiresAt,
-        OffsetDateTime revokedAt) {}
-    public record TokenPair(String accessToken, String refreshToken, long expiresInSeconds, String tokenType) {}
+    public record ProvisionedAccount(
+        UUID id,
+        String subject,
+        String email,
+        String accountType,
+        String status,
+        long version,
+        OffsetDateTime createdAt
+    ) {}
 }
