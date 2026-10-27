@@ -47,22 +47,40 @@ public class AuthService {
         String correlationId
     ) {
         var normalizedKey = requireIdempotencyKey(idempotencyKey);
-        var normalizedEmail = email.trim().toLowerCase(Locale.ROOT);
+        var previous = findByIdempotencyKey(normalizedKey);
+        if (previous != null) {
+            return validatePrevious(previous, normalizedEmail(email), fullName.trim());
+        }
+        reserveBootstrap(normalizedKey);
+        return provisionBackoffice(normalizedKey, email, fullName, temporaryPassword, correlationId, "BOOTSTRAP");
+    }
+
+    public ProvisionedAccount provisionBackoffice(
+        String idempotencyKey,
+        String email,
+        String fullName,
+        String temporaryPassword,
+        String correlationId
+    ) {
+        return provisionBackoffice(idempotencyKey, email, fullName, temporaryPassword, correlationId, "STANDARD");
+    }
+
+    private ProvisionedAccount provisionBackoffice(
+        String idempotencyKey,
+        String email,
+        String fullName,
+        String temporaryPassword,
+        String correlationId,
+        String provisioningMode
+    ) {
+        var normalizedKey = requireIdempotencyKey(idempotencyKey);
+        var normalizedEmail = normalizedEmail(email);
         var normalizedName = fullName.trim();
         var requestHash = sha256(normalizedEmail + "\n" + normalizedName);
 
         var previous = findByIdempotencyKey(normalizedKey);
         if (previous != null) {
-            if (!MessageDigest.isEqual(
-                previous.requestHash().getBytes(StandardCharsets.US_ASCII),
-                requestHash.getBytes(StandardCharsets.US_ASCII)
-            )) {
-                throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "Idempotency-Key was already used with different account data"
-                );
-            }
-            return previous.account();
+            return validatePrevious(previous, normalizedEmail, normalizedName);
         }
 
         var provisioningReference = deterministicAccountId(normalizedKey);
@@ -82,7 +100,8 @@ public class AuthService {
                 subject,
                 normalizedEmail,
                 normalizedName,
-                correlationId
+                correlationId,
+                provisioningMode
             ));
         } catch (DataIntegrityViolationException concurrentRequest) {
             var winner = findByIdempotencyKey(normalizedKey);
@@ -103,7 +122,8 @@ public class AuthService {
         String subject,
         String email,
         String fullName,
-        String correlationId
+        String correlationId,
+        String provisioningMode
     ) {
         jdbc.sql("""
             INSERT INTO identity_accounts(id, realm, subject, account_type, email, status)
@@ -135,7 +155,8 @@ public class AuthService {
             .update();
 
         var data = writeJson(new AccountProvisionedData(
-            persisted.id(), "BACKOFFICE", persisted.email(), fullName, OffsetDateTime.now(ZoneOffset.UTC)
+            persisted.id(), "BACKOFFICE", persisted.email(), fullName, provisioningMode,
+            OffsetDateTime.now(ZoneOffset.UTC)
         ));
         jdbc.sql("""
             INSERT INTO outbox_events(
@@ -152,7 +173,53 @@ public class AuthService {
             .param("payload", data)
             .param("correlationId", normalizeCorrelationId(correlationId))
             .update();
+        if ("BOOTSTRAP".equals(provisioningMode)) {
+            jdbc.sql("""
+                UPDATE authentication_bootstrap_state
+                SET identity_account_id = :accountId, completed_at = now()
+                WHERE singleton AND reservation_key = :key AND completed_at IS NULL
+                """)
+                .param("accountId", persisted.id())
+                .param("key", idempotencyKey)
+                .update();
+        }
         return persisted;
+    }
+
+    private void reserveBootstrap(String idempotencyKey) {
+        transactions.executeWithoutResult(status -> {
+            var state = jdbc.sql("""
+                SELECT reservation_key, completed_at FROM authentication_bootstrap_state
+                WHERE singleton FOR UPDATE
+                """).query(BootstrapState.class).single();
+            if (state.completedAt() != null) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "BOOTSTRAP_ALREADY_COMPLETED");
+            }
+            if (state.reservationKey() != null && !state.reservationKey().equals(idempotencyKey)) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "BOOTSTRAP_ALREADY_RESERVED");
+            }
+            jdbc.sql("""
+                UPDATE authentication_bootstrap_state SET reservation_key = :key WHERE singleton
+                """).param("key", idempotencyKey).update();
+        });
+    }
+
+    private static ProvisionedAccount validatePrevious(
+        PreviousProvisioning previous,
+        String normalizedEmail,
+        String normalizedName
+    ) {
+        var requestHash = sha256(normalizedEmail + "\n" + normalizedName);
+        if (!MessageDigest.isEqual(
+            previous.requestHash().getBytes(StandardCharsets.US_ASCII),
+            requestHash.getBytes(StandardCharsets.US_ASCII)
+        )) {
+            throw new ResponseStatusException(
+                HttpStatus.CONFLICT,
+                "Idempotency-Key was already used with different account data"
+            );
+        }
+        return previous.account();
     }
 
     private PreviousProvisioning findByIdempotencyKey(String key) {
@@ -189,13 +256,17 @@ public class AuthService {
     }
 
     private static String requireIdempotencyKey(String value) {
-        if (value == null || value.isBlank() || value.length() > 120) {
+        if (value == null || value.isBlank() || value.length() > 160) {
             throw new ResponseStatusException(
                 HttpStatus.BAD_REQUEST,
-                "Idempotency-Key is required and must not exceed 120 characters"
+                "Idempotency-Key is required and must not exceed 160 characters"
             );
         }
         return value.trim();
+    }
+
+    private static String normalizedEmail(String email) {
+        return email.trim().toLowerCase(Locale.ROOT);
     }
 
     private static UUID deterministicAccountId(String idempotencyKey) {
@@ -236,12 +307,14 @@ public class AuthService {
     }
 
     private record PreviousProvisioning(String requestHash, ProvisionedAccount account) {}
+    private record BootstrapState(String reservationKey, OffsetDateTime completedAt) {}
 
     private record AccountProvisionedData(
         UUID accountId,
         String realm,
         String email,
         String displayName,
+        String provisioningMode,
         OffsetDateTime provisionedAt
     ) {}
 
