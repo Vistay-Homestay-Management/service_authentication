@@ -1,6 +1,8 @@
 package com.vistay.authentication.adapter.out.keycloak;
 
 import java.net.URI;
+import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpMethod;
@@ -104,5 +106,70 @@ class KeycloakAdminClientTest {
 
         assertThat(actual).isEqualTo(subject.toString());
         server.verify();
+    }
+
+    @Test
+    void listsActiveSessionsFromKeycloakWithoutPersistingTokens() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = client(builder);
+        var accountId = UUID.randomUUID();
+
+        expectServiceToken(server);
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users/" + accountId + "/sessions"))
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("""
+                [{
+                  "id":"session-1",
+                  "ipAddress":"10.0.0.8",
+                  "start":1761670800000,
+                  "lastAccess":1761670860000,
+                  "clients":{"vistay-backoffice-web":"ViStay Backoffice Web"}
+                }]
+                """, MediaType.APPLICATION_JSON));
+
+        var sessions = client.listUserSessions(accountId);
+
+        assertThat(sessions).hasSize(1);
+        assertThat(sessions.getFirst().id()).isEqualTo("session-1");
+        assertThat(sessions.getFirst().startedAt()).isEqualTo(Instant.ofEpochMilli(1761670800000L));
+        assertThat(sessions.getFirst().clients()).containsKey("vistay-backoffice-web");
+        server.verify();
+    }
+
+    @Test
+    void revokesOneSpecificKeycloakSession() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = client(builder);
+
+        expectServiceToken(server);
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/sessions/session-1"))
+            .andExpect(method(HttpMethod.DELETE))
+            .andRespond(withSuccess());
+
+        client.revokeSession("session-1");
+
+        server.verify();
+    }
+
+    private static KeycloakAdminClient client(RestClient.Builder builder) {
+        return new KeycloakAdminClient(
+            builder,
+            "http://identity.test",
+            "vistay-backoffice",
+            "vistay-auth-facade",
+            "test-secret"
+        );
+    }
+
+    private static void expectServiceToken(MockRestServiceServer server) {
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/realms/vistay-backoffice/protocol/openid-connect/token"))
+            .andExpect(method(HttpMethod.POST))
+            .andRespond(withSuccess("{\"access_token\":\"service-token\",\"expires_in\":300}",
+                MediaType.APPLICATION_JSON));
     }
 }

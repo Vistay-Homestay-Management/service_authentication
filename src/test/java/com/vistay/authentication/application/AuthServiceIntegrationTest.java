@@ -1,6 +1,10 @@
 package com.vistay.authentication.application;
 
 import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient;
+import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient.ActiveSession;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
@@ -40,6 +44,7 @@ class AuthServiceIntegrationTest {
 
     private final KeycloakAdminClient keycloak = mock(KeycloakAdminClient.class);
     private AuthService service;
+    private SessionService sessionService;
 
     @BeforeAll
     static void migrate() {
@@ -66,6 +71,7 @@ class AuthServiceIntegrationTest {
             .update();
         reset(keycloak);
         service = new AuthService(jdbc, keycloak, JsonMapper.builder().build(), transactions);
+        sessionService = new SessionService(jdbc, keycloak, transactions);
     }
 
     @Test
@@ -178,6 +184,60 @@ class AuthServiceIntegrationTest {
         assertThat(count("outbox_events")).isZero();
     }
 
+    @Test
+    void revokesKeycloakSessionWithImmutableAuditAndIdempotentReplay() {
+        var actorId = UUID.randomUUID();
+        var targetId = UUID.randomUUID();
+        var correlationId = UUID.randomUUID();
+        ensureActor(actorId);
+        ensureActor(targetId);
+        when(keycloak.listUserSessions(targetId)).thenReturn(List.of(new ActiveSession(
+            "session-1", "10.0.0.8", Instant.now(), Instant.now(), Map.of("web", "Web")
+        )));
+
+        var first = sessionService.revoke(
+            "revoke-1", actorId, targetId, "session-1",
+            "Thiết bị vận hành đã bị thất lạc", correlationId.toString()
+        );
+        var replay = sessionService.revoke(
+            "revoke-1", actorId, targetId, "session-1",
+            "Thiết bị vận hành đã bị thất lạc", correlationId.toString()
+        );
+
+        assertThat(first.replayed()).isFalse();
+        assertThat(replay.replayed()).isTrue();
+        assertThat(replay.revokedAt()).isEqualTo(first.revokedAt());
+        verify(keycloak, times(1)).revokeSession("session-1");
+        var audit = jdbc.sql("""
+            SELECT actor_account_id, target_account_id, reason, correlation_id, completed_at
+            FROM session_revocation_requests WHERE idempotency_key = 'revoke-1'
+            """).query(SessionRevocationAudit.class).single();
+        assertThat(audit.actorAccountId()).isEqualTo(actorId);
+        assertThat(audit.targetAccountId()).isEqualTo(targetId);
+        assertThat(audit.reason()).isEqualTo("Thiết bị vận hành đã bị thất lạc");
+        assertThat(audit.correlationId()).isEqualTo(correlationId);
+        assertThat(audit.completedAt()).isNotNull();
+        assertThat(count("outbox_events")).isZero();
+    }
+
+    @Test
+    void missingSessionIsNotAuditedAndReservationCanBeRetried() {
+        var actorId = UUID.randomUUID();
+        var targetId = UUID.randomUUID();
+        ensureActor(actorId);
+        ensureActor(targetId);
+        when(keycloak.listUserSessions(targetId)).thenReturn(List.of());
+
+        assertThatThrownBy(() -> sessionService.revoke(
+            "missing-session", actorId, targetId, "gone",
+            "Thu hồi thiết bị không còn hoạt động", UUID.randomUUID().toString()
+        )).isInstanceOfSatisfying(ResponseStatusException.class,
+            error -> assertThat(error.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND));
+
+        assertThat(count("session_revocation_requests")).isZero();
+        assertThat(count("outbox_events")).isZero();
+    }
+
     private AuthService.ProvisionedAccount provision(
         UUID actorId,
         String key,
@@ -221,5 +281,13 @@ class AuthServiceIntegrationTest {
         String reason,
         UUID correlationId,
         String provisioningMode
+    ) {}
+
+    record SessionRevocationAudit(
+        UUID actorAccountId,
+        UUID targetAccountId,
+        String reason,
+        UUID correlationId,
+        java.time.OffsetDateTime completedAt
     ) {}
 }

@@ -44,13 +44,18 @@ public class AuthorizationClient {
     }
 
     public Snapshot require(UUID accountId, String permission) {
-        var snapshot = get(accountId);
-        if (!snapshot.active()) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Administrator profile is inactive");
-        }
+        var snapshot = requireActive(accountId);
         var scopes = snapshot.grants().get(permission);
         if (scopes == null || !scopes.contains("ALL")) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Missing permission " + permission + "@ALL");
+        }
+        return snapshot;
+    }
+
+    public Snapshot requireActive(UUID accountId) {
+        var snapshot = get(accountId);
+        if (!snapshot.active()) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Administrator profile is inactive");
         }
         return snapshot;
     }
