@@ -51,7 +51,8 @@ public class SecurityConfig {
                     "/api/v1/backoffice/accounts/bootstrap",
                     "/internal/service-info",
                     "/actuator/health/**",
-                    "/actuator/info"
+                    "/actuator/info",
+                    "/actuator/prometheus"
                 ).permitAll()
                 .anyRequest().authenticated())
             .oauth2ResourceServer(resource -> resource.jwt(Customizer.withDefaults()))

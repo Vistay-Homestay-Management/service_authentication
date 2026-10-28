@@ -46,6 +46,10 @@ spring:
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       properties:
         isolation.level: read_committed
+    listener:
+      observation-enabled: true
+    template:
+      observation-enabled: true
   data:
     redis:
       host: ${REDIS_HOST:localhost}
@@ -79,6 +83,9 @@ server:
   shutdown: graceful
 
 management:
+  tracing:
+    sampling:
+      probability: ${MANAGEMENT_TRACING_SAMPLING_PROBABILITY:1.0}
   endpoints:
     web:
       exposure:
