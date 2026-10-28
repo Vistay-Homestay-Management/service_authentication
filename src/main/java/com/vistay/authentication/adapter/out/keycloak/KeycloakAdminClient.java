@@ -108,6 +108,45 @@ public class KeycloakAdminClient {
             .toBodilessEntity();
     }
 
+    public void setUserEnabled(UUID accountId, boolean enabled) {
+        http.put()
+            .uri("/admin/realms/{realm}/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of("enabled", enabled))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public void logoutUser(UUID accountId) {
+        http.post()
+            .uri("/admin/realms/{realm}/users/{userId}/logout", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public void clearUserLoginFailures(UUID accountId) {
+        http.delete()
+            .uri("/admin/realms/{realm}/attack-detection/brute-force/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public BruteForceStatus bruteForceStatus(UUID accountId) {
+        var response = http.get()
+            .uri("/admin/realms/{realm}/attack-detection/brute-force/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .body(BruteForceRepresentation.class);
+        if (response == null) return new BruteForceStatus(false, 0, null, null);
+        return new BruteForceStatus(
+            response.disabled(), response.numFailures(), response.lastIPFailure(),
+            response.lastFailure() > 0 ? Instant.ofEpochMilli(response.lastFailure()) : null
+        );
+    }
+
     private String findExactByEmail(String email) {
         var users = http.get()
             .uri(uri -> uri
@@ -205,6 +244,12 @@ public class KeycloakAdminClient {
         List<CredentialRepresentation> credentials,
         Map<String, List<String>> attributes
     ) {}
+    private record BruteForceRepresentation(
+        boolean disabled,
+        int numFailures,
+        String lastIPFailure,
+        long lastFailure
+    ) {}
 
     public record ActiveSession(
         String id,
@@ -212,5 +257,11 @@ public class KeycloakAdminClient {
         Instant startedAt,
         Instant lastAccessAt,
         Map<String, String> clients
+    ) {}
+    public record BruteForceStatus(
+        boolean temporarilyLocked,
+        int failureCount,
+        String lastFailureIp,
+        Instant lastFailureAt
     ) {}
 }

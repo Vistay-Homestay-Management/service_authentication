@@ -2,6 +2,8 @@ package com.vistay.authentication.application;
 
 import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient;
 import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient.ActiveSession;
+import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient.BruteForceStatus;
+import com.vistay.authentication.application.AccountLifecycleService.LifecycleAction;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +47,7 @@ class AuthServiceIntegrationTest {
     private final KeycloakAdminClient keycloak = mock(KeycloakAdminClient.class);
     private AuthService service;
     private SessionService sessionService;
+    private AccountLifecycleService lifecycleService;
 
     @BeforeAll
     static void migrate() {
@@ -72,6 +75,7 @@ class AuthServiceIntegrationTest {
         reset(keycloak);
         service = new AuthService(jdbc, keycloak, JsonMapper.builder().build(), transactions);
         sessionService = new SessionService(jdbc, keycloak, transactions);
+        lifecycleService = new AccountLifecycleService(jdbc, keycloak, transactions);
     }
 
     @Test
@@ -236,6 +240,81 @@ class AuthServiceIntegrationTest {
 
         assertThat(count("session_revocation_requests")).isZero();
         assertThat(count("outbox_events")).isZero();
+    }
+
+    @Test
+    void locksAccountRevokesSessionsAndReplaysImmutableAudit() {
+        var actorId = UUID.randomUUID();
+        var targetId = UUID.randomUUID();
+        var correlation = UUID.randomUUID();
+        ensureActor(actorId);
+        ensureActor(targetId);
+
+        var first = lifecycleService.change("lock-account-1", actorId, targetId,
+            LifecycleAction.LOCK, 0, "Khóa tài khoản đang có dấu hiệu bất thường", correlation.toString());
+        var replay = lifecycleService.change("lock-account-1", actorId, targetId,
+            LifecycleAction.LOCK, 0, "Khóa tài khoản đang có dấu hiệu bất thường", correlation.toString());
+
+        assertThat(first.status()).isEqualTo("LOCKED");
+        assertThat(first.version()).isEqualTo(1);
+        assertThat(first.replayed()).isFalse();
+        assertThat(replay.completedAt()).isEqualTo(first.completedAt());
+        assertThat(replay.replayed()).isTrue();
+        verify(keycloak, times(1)).setUserEnabled(targetId, false);
+        verify(keycloak, times(1)).logoutUser(targetId);
+        assertThat(lifecycleService.events(targetId)).hasSize(1);
+    }
+
+    @Test
+    void recoversDisabledAccountByClearingFailuresAndEnablingKeycloakUser() {
+        var actorId = UUID.randomUUID();
+        var targetId = UUID.randomUUID();
+        ensureActor(actorId);
+        ensureActor(targetId);
+        jdbc.sql("UPDATE identity_accounts SET status = 'DISABLED', version = 4 WHERE id = :id")
+            .param("id", targetId).update();
+
+        var result = lifecycleService.change("recover-account-1", actorId, targetId,
+            LifecycleAction.RECOVER, 4, "Khôi phục sau khi hoàn tất điều tra bảo mật", null);
+
+        assertThat(result.status()).isEqualTo("ACTIVE");
+        assertThat(result.version()).isEqualTo(5);
+        verify(keycloak).clearUserLoginFailures(targetId);
+        verify(keycloak).setUserEnabled(targetId, true);
+    }
+
+    @Test
+    void identityProviderFailureRollsBackReservationAndProjection() {
+        var actorId = UUID.randomUUID();
+        var targetId = UUID.randomUUID();
+        ensureActor(actorId);
+        ensureActor(targetId);
+        org.mockito.Mockito.doThrow(new ResourceAccessException("Keycloak timed out"))
+            .when(keycloak).setUserEnabled(targetId, false);
+
+        assertThatThrownBy(() -> lifecycleService.change("lock-timeout", actorId, targetId,
+            LifecycleAction.LOCK, 0, "Khóa do phát hiện đăng nhập bất thường", null))
+            .isInstanceOfSatisfying(ResponseStatusException.class,
+                error -> assertThat(error.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
+
+        assertThat(count("account_lifecycle_requests")).isZero();
+        assertThat(jdbc.sql("SELECT status FROM identity_accounts WHERE id = :id")
+            .param("id", targetId).query(String.class).single()).isEqualTo("ACTIVE");
+    }
+
+    @Test
+    void reportsProjectionAndRedactedBruteForceInvestigationState() {
+        var targetId = UUID.randomUUID();
+        ensureActor(targetId);
+        when(keycloak.bruteForceStatus(targetId)).thenReturn(new BruteForceStatus(
+            true, 5, "10.0.0.8", Instant.parse("2026-10-28T16:00:00Z")
+        ));
+
+        var view = lifecycleService.get(targetId);
+
+        assertThat(view.account().email()).contains("@vistay.test");
+        assertThat(view.bruteForce().temporarilyLocked()).isTrue();
+        assertThat(view.bruteForce().failureCount()).isEqualTo(5);
     }
 
     private AuthService.ProvisionedAccount provision(
