@@ -48,7 +48,7 @@ public class AuthController {
         @AuthenticationPrincipal Jwt jwt,
         @RequestHeader("Idempotency-Key") String idempotencyKey,
         @RequestHeader(name = "X-Correlation-Id", required = false) String correlationId,
-        @Valid @RequestBody BootstrapBackofficeAccount request
+        @Valid @RequestBody ProvisionBackofficeAccount request
     ) {
         UUID accountId;
         try {
@@ -59,9 +59,11 @@ public class AuthController {
         authorizations.require(accountId, "account:provision");
         return auth.provisionBackoffice(
             idempotencyKey,
+            accountId,
             request.email(),
             request.fullName(),
             request.temporaryPassword(),
+            request.reason(),
             correlationId
         );
     }
@@ -72,7 +74,7 @@ public class AuthController {
         @RequestHeader("X-ViStay-Bootstrap-Token") String presentedBootstrapToken,
         @RequestHeader("Idempotency-Key") String idempotencyKey,
         @RequestHeader(name = "X-Correlation-Id", required = false) String correlationId,
-        @Valid @RequestBody BootstrapBackofficeAccount request
+        @Valid @RequestBody ProvisionBackofficeAccount request
     ) {
         if (!MessageDigest.isEqual(
             bootstrapToken,
@@ -85,13 +87,15 @@ public class AuthController {
             request.email(),
             request.fullName(),
             request.temporaryPassword(),
+            request.reason(),
             correlationId
         );
     }
 
-    public record BootstrapBackofficeAccount(
+    public record ProvisionBackofficeAccount(
         @Email @NotBlank String email,
         @NotBlank @Size(max = 180) String fullName,
-        @NotBlank @Size(min = 12, max = 128) String temporaryPassword
+        @NotBlank @Size(min = 12, max = 128) String temporaryPassword,
+        @NotBlank @Size(min = 8, max = 500) String reason
     ) {}
 }

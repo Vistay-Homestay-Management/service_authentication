@@ -71,4 +71,38 @@ class KeycloakAdminClientTest {
         assertThat(actual).isEqualTo(subject.toString());
         server.verify();
     }
+
+    @Test
+    void reusesExistingKeycloakUserWhenRepairingAPartialProvisioningAttempt() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = new KeycloakAdminClient(
+            builder,
+            "http://identity.test",
+            "vistay-backoffice",
+            "vistay-auth-facade",
+            "test-secret"
+        );
+        var subject = UUID.randomUUID();
+
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/realms/vistay-backoffice/protocol/openid-connect/token"))
+            .andExpect(method(HttpMethod.POST))
+            .andRespond(withSuccess("{\"access_token\":\"service-token\",\"expires_in\":300}",
+                MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users"))
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("[{\"id\":\"" + subject + "\"}]", MediaType.APPLICATION_JSON));
+
+        var actual = client.ensureBackofficeUser(
+            "repair@vistay.test",
+            "Repair Operator",
+            "temporary-password",
+            UUID.randomUUID()
+        );
+
+        assertThat(actual).isEqualTo(subject.toString());
+        server.verify();
+    }
 }

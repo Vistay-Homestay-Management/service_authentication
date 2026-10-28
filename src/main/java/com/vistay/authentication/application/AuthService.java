@@ -14,6 +14,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
@@ -44,63 +45,96 @@ public class AuthService {
         String email,
         String fullName,
         String temporaryPassword,
+        String reason,
         String correlationId
     ) {
         var normalizedKey = requireIdempotencyKey(idempotencyKey);
         var previous = findByIdempotencyKey(normalizedKey);
         if (previous != null) {
-            return validatePrevious(previous, normalizedEmail(email), fullName.trim());
+            return validatePrevious(previous, normalizedEmail(email), fullName.trim(),
+                normalizeReason(reason));
         }
         reserveBootstrap(normalizedKey);
-        return provisionBackoffice(normalizedKey, email, fullName, temporaryPassword, correlationId, "BOOTSTRAP");
+        return provisionBackoffice(normalizedKey, null, email, fullName, temporaryPassword,
+            reason, correlationId, "BOOTSTRAP");
     }
 
     public ProvisionedAccount provisionBackoffice(
         String idempotencyKey,
+        UUID actorAccountId,
         String email,
         String fullName,
         String temporaryPassword,
+        String reason,
         String correlationId
     ) {
-        return provisionBackoffice(idempotencyKey, email, fullName, temporaryPassword, correlationId, "STANDARD");
+        if (actorAccountId == null) {
+            throw new IllegalArgumentException("actorAccountId is required for standard provisioning");
+        }
+        return provisionBackoffice(idempotencyKey, actorAccountId, email, fullName,
+            temporaryPassword, reason, correlationId, "STANDARD");
     }
 
     private ProvisionedAccount provisionBackoffice(
         String idempotencyKey,
+        UUID actorAccountId,
         String email,
         String fullName,
         String temporaryPassword,
+        String reason,
         String correlationId,
         String provisioningMode
     ) {
         var normalizedKey = requireIdempotencyKey(idempotencyKey);
         var normalizedEmail = normalizedEmail(email);
         var normalizedName = fullName.trim();
-        var requestHash = sha256(normalizedEmail + "\n" + normalizedName);
+        var normalizedReason = normalizeReason(reason);
+        var normalizedCorrelationId = normalizeCorrelationId(correlationId);
+        var requestHash = requestHashV2(
+            normalizedEmail, normalizedName, normalizedReason
+        );
 
         var previous = findByIdempotencyKey(normalizedKey);
         if (previous != null) {
-            return validatePrevious(previous, normalizedEmail, normalizedName);
+            return validatePrevious(previous, normalizedEmail, normalizedName,
+                normalizedReason);
+        }
+        if (findByEmail(normalizedEmail) != null) {
+            throw new ResponseStatusException(
+                HttpStatus.CONFLICT,
+                "BACKOFFICE_ACCOUNT_ALREADY_EXISTS"
+            );
         }
 
         var provisioningReference = deterministicAccountId(normalizedKey);
-        var subject = keycloak.ensureBackofficeUser(
-            normalizedEmail,
-            normalizedName,
-            temporaryPassword,
-            provisioningReference
-        );
+        String subject;
+        try {
+            subject = keycloak.ensureBackofficeUser(
+                normalizedEmail,
+                normalizedName,
+                temporaryPassword,
+                provisioningReference
+            );
+        } catch (RestClientException identityProviderFailure) {
+            throw new ResponseStatusException(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "IDENTITY_PROVIDER_UNAVAILABLE",
+                identityProviderFailure
+            );
+        }
         var identityAccountId = keycloakSubject(subject);
 
         try {
             return transactions.execute(status -> persistProvisioning(
                 normalizedKey,
                 requestHash,
+                actorAccountId,
                 identityAccountId,
                 subject,
                 normalizedEmail,
                 normalizedName,
-                correlationId,
+                normalizedReason,
+                normalizedCorrelationId,
                 provisioningMode
             ));
         } catch (DataIntegrityViolationException concurrentRequest) {
@@ -109,7 +143,8 @@ public class AuthService {
                 winner.requestHash().getBytes(StandardCharsets.US_ASCII),
                 requestHash.getBytes(StandardCharsets.US_ASCII)
             )) {
-                return winner.account();
+                return validatePrevious(winner, normalizedEmail, normalizedName,
+                    normalizedReason);
             }
             throw concurrentRequest;
         }
@@ -118,40 +153,66 @@ public class AuthService {
     private ProvisionedAccount persistProvisioning(
         String idempotencyKey,
         String requestHash,
+        UUID actorAccountId,
         UUID identityAccountId,
         String subject,
         String email,
         String fullName,
+        String reason,
         String correlationId,
         String provisioningMode
     ) {
-        jdbc.sql("""
+        var inserted = jdbc.sql("""
             INSERT INTO identity_accounts(id, realm, subject, account_type, email, status)
             VALUES (:id, 'vistay-backoffice', :subject, 'ADMIN', :email, 'ACTIVE')
-            ON CONFLICT (realm, subject) DO UPDATE
-            SET email = EXCLUDED.email, updated_at = now()
+            ON CONFLICT DO NOTHING
+            RETURNING id, subject, email, account_type, status, version, created_at
             """)
             .param("id", identityAccountId)
             .param("subject", subject)
             .param("email", email)
-            .update();
+            .query(ProvisionedAccount.class)
+            .optional()
+            .orElse(null);
+
+        if (inserted == null) {
+            var concurrentRetry = findByIdempotencyKey(idempotencyKey);
+            if (concurrentRetry != null && MessageDigest.isEqual(
+                concurrentRetry.requestHash().getBytes(StandardCharsets.US_ASCII),
+                requestHash.getBytes(StandardCharsets.US_ASCII)
+            )) {
+                return concurrentRetry.account();
+            }
+            throw new ResponseStatusException(
+                HttpStatus.CONFLICT,
+                "BACKOFFICE_ACCOUNT_ALREADY_EXISTS"
+            );
+        }
 
         var persisted = jdbc.sql("""
             SELECT id, subject, email, account_type, status, version, created_at
-            FROM identity_accounts
-            WHERE realm = 'vistay-backoffice' AND subject = :subject
+            FROM identity_accounts WHERE id = :id
             """)
-            .param("subject", subject)
+            .param("id", inserted.id())
             .query(ProvisionedAccount.class)
             .single();
 
         jdbc.sql("""
-            INSERT INTO provisioning_requests(idempotency_key, request_hash, identity_account_id, completed_at)
-            VALUES (:key, :requestHash, :accountId, now())
+            INSERT INTO provisioning_requests(
+                idempotency_key, request_hash, request_hash_version, identity_account_id,
+                actor_account_id, reason, correlation_id, provisioning_mode, completed_at
+            ) VALUES (
+                :key, :requestHash, 2, :accountId,
+                :actorAccountId, :reason, :correlationId, :provisioningMode, now()
+            )
             """)
             .param("key", idempotencyKey)
             .param("requestHash", requestHash)
             .param("accountId", persisted.id())
+            .param("actorAccountId", actorAccountId)
+            .param("reason", reason)
+            .param("correlationId", UUID.fromString(correlationId))
+            .param("provisioningMode", provisioningMode)
             .update();
 
         var data = writeJson(new AccountProvisionedData(
@@ -171,7 +232,7 @@ public class AuthService {
             .param("aggregateVersion", persisted.version() + 1)
             .param("eventType", BACKOFFICE_ACCOUNT_PROVISIONED)
             .param("payload", data)
-            .param("correlationId", normalizeCorrelationId(correlationId))
+            .param("correlationId", correlationId)
             .update();
         if ("BOOTSTRAP".equals(provisioningMode)) {
             jdbc.sql("""
@@ -207,9 +268,12 @@ public class AuthService {
     private static ProvisionedAccount validatePrevious(
         PreviousProvisioning previous,
         String normalizedEmail,
-        String normalizedName
+        String normalizedName,
+        String normalizedReason
     ) {
-        var requestHash = sha256(normalizedEmail + "\n" + normalizedName);
+        var requestHash = previous.requestHashVersion() == 1
+            ? sha256(normalizedEmail + "\n" + normalizedName)
+            : requestHashV2(normalizedEmail, normalizedName, normalizedReason);
         if (!MessageDigest.isEqual(
             previous.requestHash().getBytes(StandardCharsets.US_ASCII),
             requestHash.getBytes(StandardCharsets.US_ASCII)
@@ -222,9 +286,21 @@ public class AuthService {
         return previous.account();
     }
 
+    private ProvisionedAccount findByEmail(String email) {
+        return jdbc.sql("""
+            SELECT id, subject, email, account_type, status, version, created_at
+            FROM identity_accounts
+            WHERE realm = 'vistay-backoffice' AND email = :email
+            """)
+            .param("email", email)
+            .query(ProvisionedAccount.class)
+            .optional()
+            .orElse(null);
+    }
+
     private PreviousProvisioning findByIdempotencyKey(String key) {
         return jdbc.sql("""
-            SELECT pr.request_hash, ia.id, ia.subject, ia.email, ia.account_type,
+            SELECT pr.request_hash, pr.request_hash_version, ia.id, ia.subject, ia.email, ia.account_type,
                    ia.status, ia.version, ia.created_at
             FROM provisioning_requests pr
             JOIN identity_accounts ia ON ia.id = pr.identity_account_id
@@ -233,6 +309,7 @@ public class AuthService {
             .param("key", key)
             .query((rs, rowNum) -> new PreviousProvisioning(
                 rs.getString("request_hash"),
+                rs.getInt("request_hash_version"),
                 new ProvisionedAccount(
                     rs.getObject("id", UUID.class),
                     rs.getString("subject"),
@@ -267,6 +344,17 @@ public class AuthService {
 
     private static String normalizedEmail(String email) {
         return email.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static String normalizeReason(String reason) {
+        var normalized = reason == null ? "" : reason.trim();
+        if (normalized.length() < 8 || normalized.length() > 500) {
+            throw new ResponseStatusException(
+                HttpStatus.BAD_REQUEST,
+                "reason must contain between 8 and 500 characters"
+            );
+        }
+        return normalized;
     }
 
     private static UUID deterministicAccountId(String idempotencyKey) {
@@ -306,7 +394,19 @@ public class AuthService {
         }
     }
 
-    private record PreviousProvisioning(String requestHash, ProvisionedAccount account) {}
+    private static String requestHashV2(
+        String email,
+        String fullName,
+        String reason
+    ) {
+        return sha256(String.join("\n", "v2", email, fullName, reason));
+    }
+
+    private record PreviousProvisioning(
+        String requestHash,
+        int requestHashVersion,
+        ProvisionedAccount account
+    ) {}
     private record BootstrapState(String reservationKey, OffsetDateTime completedAt) {}
 
     private record AccountProvisionedData(
