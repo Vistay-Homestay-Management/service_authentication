@@ -32,7 +32,12 @@ public class SecurityConfig {
             : OAuth2TokenValidatorResult.failure(new OAuth2Error(
                 "invalid_token", "Required audience is missing", null
             ));
-        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(List.of(withIssuer, withAudience)));
+        OAuth2TokenValidator<Jwt> withAccountType = token -> "ADMIN".equals(token.getClaimAsString("account_type"))
+            ? OAuth2TokenValidatorResult.success()
+            : OAuth2TokenValidatorResult.failure(new OAuth2Error(
+                "invalid_token", "Required account_type ADMIN is missing", null));
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(List.of(
+            withIssuer, withAudience, withAccountType)));
         return decoder;
     }
 
@@ -46,7 +51,8 @@ public class SecurityConfig {
                     "/api/v1/backoffice/accounts/bootstrap",
                     "/internal/service-info",
                     "/actuator/health/**",
-                    "/actuator/info"
+                    "/actuator/info",
+                    "/actuator/prometheus"
                 ).permitAll()
                 .anyRequest().authenticated())
             .oauth2ResourceServer(resource -> resource.jwt(Customizer.withDefaults()))

@@ -2,6 +2,7 @@ package com.vistay.authentication.adapter.out.keycloak;
 
 import java.net.URI;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -77,6 +78,73 @@ public class KeycloakAdminClient {
             }
             throw duplicate;
         }
+    }
+
+    public List<ActiveSession> listUserSessions(UUID accountId) {
+        var sessions = http.get()
+            .uri("/admin/realms/{realm}/users/{userId}/sessions", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .body(UserSessionRepresentation[].class);
+        if (sessions == null) {
+            return List.of();
+        }
+        return Arrays.stream(sessions)
+            .map(session -> new ActiveSession(
+                session.id(),
+                session.ipAddress(),
+                Instant.ofEpochMilli(session.start()),
+                Instant.ofEpochMilli(session.lastAccess()),
+                session.clients() == null ? Map.of() : Map.copyOf(session.clients())
+            ))
+            .toList();
+    }
+
+    public void revokeSession(String sessionId) {
+        http.delete()
+            .uri("/admin/realms/{realm}/sessions/{sessionId}", realm, sessionId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public void setUserEnabled(UUID accountId, boolean enabled) {
+        http.put()
+            .uri("/admin/realms/{realm}/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of("enabled", enabled))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public void logoutUser(UUID accountId) {
+        http.post()
+            .uri("/admin/realms/{realm}/users/{userId}/logout", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public void clearUserLoginFailures(UUID accountId) {
+        http.delete()
+            .uri("/admin/realms/{realm}/attack-detection/brute-force/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public BruteForceStatus bruteForceStatus(UUID accountId) {
+        var response = http.get()
+            .uri("/admin/realms/{realm}/attack-detection/brute-force/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .body(BruteForceRepresentation.class);
+        if (response == null) return new BruteForceStatus(false, 0, null, null);
+        return new BruteForceStatus(
+            response.disabled(), response.numFailures(), response.lastIPFailure(),
+            response.lastFailure() > 0 ? Instant.ofEpochMilli(response.lastFailure()) : null
+        );
     }
 
     private String findExactByEmail(String email) {
@@ -157,6 +225,13 @@ public class KeycloakAdminClient {
         @com.fasterxml.jackson.annotation.JsonProperty("expires_in") long expiresIn
     ) {}
     private record UserSummary(String id) {}
+    private record UserSessionRepresentation(
+        String id,
+        String ipAddress,
+        long start,
+        long lastAccess,
+        Map<String, String> clients
+    ) {}
     private record CredentialRepresentation(String type, String value, boolean temporary) {}
     private record UserRepresentation(
         String username,
@@ -168,5 +243,25 @@ public class KeycloakAdminClient {
         List<String> requiredActions,
         List<CredentialRepresentation> credentials,
         Map<String, List<String>> attributes
+    ) {}
+    private record BruteForceRepresentation(
+        boolean disabled,
+        int numFailures,
+        String lastIPFailure,
+        long lastFailure
+    ) {}
+
+    public record ActiveSession(
+        String id,
+        String ipAddress,
+        Instant startedAt,
+        Instant lastAccessAt,
+        Map<String, String> clients
+    ) {}
+    public record BruteForceStatus(
+        boolean temporarilyLocked,
+        int failureCount,
+        String lastFailureIp,
+        Instant lastFailureAt
     ) {}
 }

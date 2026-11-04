@@ -40,9 +40,16 @@ spring:
       properties:
         enable.idempotence: true
     consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:vistay-authentication}
       enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       properties:
         isolation.level: read_committed
+    listener:
+      observation-enabled: true
+    template:
+      observation-enabled: true
   data:
     redis:
       host: ${REDIS_HOST:localhost}
@@ -54,12 +61,31 @@ spring:
         jwt:
           issuer-uri: ${KEYCLOAK_BACKOFFICE_ISSUER:http://localhost:8180/realms/vistay-backoffice}
           jwk-set-uri: ${KEYCLOAK_BACKOFFICE_JWKS_URI:http://localhost:8180/realms/vistay-backoffice/protocol/openid-connect/certs}
+  grpc:
+    client:
+      channel:
+        user:
+          target: ${USER_GRPC_ADDRESS:static://localhost:9090}
+          ssl:
+            bundle: ${USER_GRPC_SSL_BUNDLE:grpc-user-client}
+  ssl:
+    bundle:
+      pem:
+        grpc-user-client:
+          keystore:
+            certificate: ${GRPC_CLIENT_CERT:file:/run/secrets/grpc/authentication.crt}
+            private-key: ${GRPC_CLIENT_KEY:file:/run/secrets/grpc/authentication.key}
+          truststore:
+            certificate: ${GRPC_SERVER_CA_CERT:file:/run/secrets/grpc/ca.crt}
 
 server:
   port: ${SERVER_PORT:8080}
   shutdown: graceful
 
 management:
+  tracing:
+    sampling:
+      probability: ${MANAGEMENT_TRACING_SAMPLING_PROBABILITY:1.0}
   endpoints:
     web:
       exposure:
@@ -76,6 +102,9 @@ logging:
       console: logstash
 
 vistay:
+  http:
+    connect-timeout-ms: ${HTTP_CONNECT_TIMEOUT_MS:2000}
+    read-timeout-ms: ${HTTP_READ_TIMEOUT_MS:5000}
   security:
     audience: ${KEYCLOAK_BACKOFFICE_AUDIENCE:vistay-backoffice-api}
   bootstrap:
@@ -88,3 +117,8 @@ vistay:
   outbox:
     poll-delay-ms: ${OUTBOX_POLL_DELAY_MS:1000}
     send-timeout-seconds: ${OUTBOX_SEND_TIMEOUT_SECONDS:10}
+  topics:
+    authorization-changed: ${AUTHORIZATION_CHANGED_TOPIC:vistay.user.authorization-changed.v1}
+  authorization:
+    local-cache-ttl: ${AUTHORIZATION_LOCAL_CACHE_TTL:30s}
+    grpc-deadline: ${AUTHORIZATION_GRPC_DEADLINE:2s}
