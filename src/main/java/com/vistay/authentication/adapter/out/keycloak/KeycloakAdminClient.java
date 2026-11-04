@@ -2,10 +2,12 @@ package com.vistay.authentication.adapter.out.keycloak;
 
 import java.net.URI;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -20,19 +22,44 @@ public class KeycloakAdminClient {
     private final String realm;
     private final String clientId;
     private final String clientSecret;
+    private final String hostRealm;
+    private final String hostClientId;
+    private final int hostActionLifespanSeconds;
+    private final String hostRedirectUri;
     private volatile CachedToken cachedToken;
 
+    @Autowired
     public KeycloakAdminClient(
         RestClient.Builder builder,
         @Value("${vistay.keycloak.base-url}") String baseUrl,
         @Value("${vistay.keycloak.backoffice-realm}") String realm,
         @Value("${vistay.keycloak.admin-client-id}") String clientId,
-        @Value("${vistay.keycloak.admin-client-secret}") String clientSecret
+        @Value("${vistay.keycloak.admin-client-secret}") String clientSecret,
+        @Value("${vistay.keycloak.host-realm:vistay-host}") String hostRealm,
+        @Value("${vistay.keycloak.host-client-id:vistay-host-web}") String hostClientId,
+        @Value("${vistay.keycloak.host-action-lifespan-seconds:900}") int hostActionLifespanSeconds,
+        @Value("${vistay.keycloak.host-redirect-uri:http://host.localhost/oidc/callback}") String hostRedirectUri
     ) {
         this.http = builder.baseUrl(baseUrl).build();
         this.realm = realm;
         this.clientId = clientId;
         this.clientSecret = clientSecret;
+        this.hostRealm = hostRealm;
+        this.hostClientId = hostClientId;
+        this.hostActionLifespanSeconds = hostActionLifespanSeconds;
+        this.hostRedirectUri = hostRedirectUri;
+    }
+
+    public KeycloakAdminClient(
+        RestClient.Builder builder,
+        String baseUrl,
+        String realm,
+        String clientId,
+        String clientSecret
+    ) {
+        this(builder, baseUrl, realm, clientId, clientSecret,
+            "vistay-host", "vistay-host-web", 900,
+            "http://host.localhost/oidc/callback");
     }
 
     public String ensureBackofficeUser(
@@ -41,9 +68,9 @@ public class KeycloakAdminClient {
         String temporaryPassword,
         UUID provisioningReference
     ) {
-        var existing = findExactByEmail(email);
+        var existing = findExactUserByEmail(realm, email);
         if (existing != null) {
-            return existing;
+            return existing.id();
         }
 
         var name = splitName(fullName);
@@ -72,12 +99,91 @@ public class KeycloakAdminClient {
                 .toBodilessEntity();
             return subjectFromLocation(response.getHeaders().getLocation());
         } catch (HttpClientErrorException.Conflict duplicate) {
-            var concurrent = findExactByEmail(email);
+            var concurrent = findExactUserByEmail(realm, email);
             if (concurrent != null) {
-                return concurrent;
+                return concurrent.id();
             }
             throw duplicate;
         }
+    }
+
+    public HostIdentity ensureHostUser(
+        String email,
+        String fullName,
+        String phone,
+        UUID invitationId
+    ) {
+        var existing = findExactUserByEmail(hostRealm, email);
+        if (existing != null) {
+            return verifyHostIdentity(existing, invitationId);
+        }
+
+        var name = splitName(fullName);
+        var attributes = new LinkedHashMap<String, List<String>>();
+        attributes.put("vistay_account_type", List.of("HOST"));
+        attributes.put("vistay_invitation_id", List.of(invitationId.toString()));
+        if (phone != null && !phone.isBlank()) {
+            attributes.put("phone", List.of(phone));
+        }
+        var representation = new UserRepresentation(
+            email,
+            email,
+            name.firstName(),
+            name.lastName(),
+            true,
+            false,
+            List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"),
+            List.of(),
+            attributes
+        );
+
+        try {
+            var response = http.post()
+                .uri("/admin/realms/{realm}/users", hostRealm)
+                .headers(headers -> headers.setBearerAuth(accessToken()))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(representation)
+                .retrieve()
+                .toBodilessEntity();
+            return new HostIdentity(subjectFromLocation(response.getHeaders().getLocation()));
+        } catch (HttpClientErrorException.Conflict duplicate) {
+            var concurrent = findExactUserByEmail(hostRealm, email);
+            if (concurrent != null) {
+                return verifyHostIdentity(concurrent, invitationId);
+            }
+            throw duplicate;
+        }
+    }
+
+    public void sendHostActivationEmail(String subject) {
+        http.put()
+            .uri(uri -> uri
+                .path("/admin/realms/{realm}/users/{userId}/execute-actions-email")
+                .queryParam("lifespan", hostActionLifespanSeconds)
+                .queryParam("client_id", hostClientId)
+                .queryParam("redirect_uri", hostRedirectUri)
+                .build(hostRealm, subject))
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
+    public HostActivationState hostActivationState(String subject) {
+        var user = http.get()
+            .uri("/admin/realms/{realm}/users/{userId}", hostRealm, subject)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve()
+            .body(UserSummary.class);
+        if (user == null) {
+            throw new IllegalStateException("Keycloak returned no Host identity state");
+        }
+        return new HostActivationState(
+            Boolean.TRUE.equals(user.emailVerified()),
+            Boolean.TRUE.equals(user.enabled()),
+            user.requiredActions() == null ? List.of() : List.copyOf(user.requiredActions())
+        );
     }
 
     public List<ActiveSession> listUserSessions(UUID accountId) {
@@ -147,14 +253,14 @@ public class KeycloakAdminClient {
         );
     }
 
-    private String findExactByEmail(String email) {
+    private UserSummary findExactUserByEmail(String targetRealm, String email) {
         var users = http.get()
             .uri(uri -> uri
                 .path("/admin/realms/{realm}/users")
                 .queryParam("email", email)
                 .queryParam("exact", true)
                 .queryParam("max", 2)
-                .build(realm))
+                .build(targetRealm))
             .headers(headers -> headers.setBearerAuth(accessToken()))
             .retrieve()
             .body(UserSummary[].class);
@@ -164,7 +270,22 @@ public class KeycloakAdminClient {
         if (users.length > 1) {
             throw new IllegalStateException("Keycloak returned multiple exact users for one email");
         }
-        return users[0].id();
+        return users[0];
+    }
+
+    private static HostIdentity verifyHostIdentity(UserSummary existing, UUID invitationId) {
+        var invitation = firstAttribute(existing.attributes(), "vistay_invitation_id");
+        if (!invitationId.toString().equals(invitation)) {
+            throw new HostSubjectCollisionException();
+        }
+        return new HostIdentity(existing.id());
+    }
+
+    private static String firstAttribute(Map<String, List<String>> attributes, String name) {
+        if (attributes == null || attributes.get(name) == null || attributes.get(name).isEmpty()) {
+            return null;
+        }
+        return attributes.get(name).getFirst();
     }
 
     private String accessToken() {
@@ -224,7 +345,13 @@ public class KeycloakAdminClient {
         @com.fasterxml.jackson.annotation.JsonProperty("access_token") String accessToken,
         @com.fasterxml.jackson.annotation.JsonProperty("expires_in") long expiresIn
     ) {}
-    private record UserSummary(String id) {}
+    private record UserSummary(
+        String id,
+        Boolean emailVerified,
+        Boolean enabled,
+        List<String> requiredActions,
+        Map<String, List<String>> attributes
+    ) {}
     private record UserSessionRepresentation(
         String id,
         String ipAddress,
@@ -264,4 +391,17 @@ public class KeycloakAdminClient {
         String lastFailureIp,
         Instant lastFailureAt
     ) {}
+
+    public record HostIdentity(String subject) {}
+    public record HostActivationState(
+        boolean emailVerified,
+        boolean enabled,
+        List<String> requiredActions
+    ) {}
+
+    public static final class HostSubjectCollisionException extends RuntimeException {
+        public HostSubjectCollisionException() {
+            super("HOST_SUBJECT_COLLISION");
+        }
+    }
 }

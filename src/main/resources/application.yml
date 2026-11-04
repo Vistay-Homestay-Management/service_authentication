@@ -114,6 +114,12 @@ vistay:
     backoffice-realm: ${KEYCLOAK_BACKOFFICE_REALM:vistay-backoffice}
     admin-client-id: ${KEYCLOAK_ADMIN_CLIENT_ID:vistay-auth-facade}
     admin-client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:local-keycloak-client-secret}
+    host-realm: ${KEYCLOAK_HOST_REALM:vistay-host}
+    host-client-id: ${KEYCLOAK_HOST_CLIENT_ID:vistay-host-web}
+    host-action-lifespan-seconds: ${KEYCLOAK_HOST_ACTION_LIFESPAN_SECONDS:900}
+    host-redirect-uri: ${VISTAY_HOST_WEB_REDIRECT_URI:http://host.localhost/oidc/callback}
+  host-invitation:
+    ttl: ${HOST_INVITATION_TTL:PT24H}
   outbox:
     poll-delay-ms: ${OUTBOX_POLL_DELAY_MS:1000}
     send-timeout-seconds: ${OUTBOX_SEND_TIMEOUT_SECONDS:10}
