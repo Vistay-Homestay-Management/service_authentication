@@ -44,10 +44,24 @@ public class AuthorizationClient {
     }
 
     public Snapshot require(UUID accountId, String permission) {
+        return requireAnyScope(accountId, permission, "ALL");
+    }
+
+    public Snapshot requireAnyScope(UUID accountId, String permission, String... allowedScopes) {
         var snapshot = requireActive(accountId);
         var scopes = snapshot.grants().get(permission);
-        if (scopes == null || !scopes.contains("ALL")) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Missing permission " + permission + "@ALL");
+        var allowed = false;
+        if (scopes != null) {
+            for (var scope : allowedScopes) {
+                if (scopes.contains(scope)) {
+                    allowed = true;
+                    break;
+                }
+            }
+        }
+        if (!allowed) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,
+                "Missing permission " + permission + "@" + String.join("|", allowedScopes));
         }
         return snapshot;
     }
