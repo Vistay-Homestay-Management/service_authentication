@@ -109,6 +109,80 @@ class KeycloakAdminClientTest {
     }
 
     @Test
+    void provisionsHostWithoutLocalCredentialsAndObservesActivationState() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = hostClient(builder);
+        var invitationId = UUID.randomUUID();
+        var subject = UUID.randomUUID();
+
+        expectServiceToken(server);
+        server.expect(once(), request -> {
+                assertThat(request.getURI().getPath())
+                    .isEqualTo("/admin/realms/vistay-host/users");
+                assertThat(request.getURI().getQuery())
+                    .contains("email=host@vistay.test", "exact=true", "max=2");
+            })
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("[]", MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-host/users"))
+            .andExpect(method(HttpMethod.POST))
+            .andExpect(content().json("""
+                {
+                  "username": "host@vistay.test",
+                  "email": "host@vistay.test",
+                  "firstName": "Host",
+                  "lastName": "Operator",
+                  "enabled": true,
+                  "emailVerified": false,
+                  "requiredActions": ["VERIFY_EMAIL", "UPDATE_PASSWORD"],
+                  "credentials": [],
+                  "attributes": {
+                    "vistay_account_type": ["HOST"],
+                    "vistay_invitation_id": ["%s"],
+                    "phone": ["+84900000000"]
+                  }
+                }
+                """.formatted(invitationId), JsonCompareMode.LENIENT))
+            .andRespond(withCreatedEntity(URI.create(
+                "http://identity.test/admin/realms/vistay-host/users/" + subject
+            )));
+        server.expect(once(), request -> {
+                assertThat(request.getURI().getPath()).isEqualTo(
+                    "/admin/realms/vistay-host/users/" + subject + "/execute-actions-email");
+                assertThat(request.getURI().getQuery())
+                    .contains("lifespan=900", "client_id=vistay-host-web",
+                        "redirect_uri=http://host.localhost/oidc/callback");
+            })
+            .andExpect(method(HttpMethod.PUT))
+            .andExpect(content().json("[\"VERIFY_EMAIL\",\"UPDATE_PASSWORD\"]"))
+            .andRespond(withSuccess());
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-host/users/" + subject))
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("""
+                {
+                  "id": "%s",
+                  "emailVerified": true,
+                  "enabled": true,
+                  "requiredActions": []
+                }
+                """.formatted(subject), MediaType.APPLICATION_JSON));
+
+        assertThat(client.ensureHostUser(
+            "host@vistay.test", "Host Operator", "+84900000000", invitationId
+        ).subject()).isEqualTo(subject.toString());
+        client.sendHostActivationEmail(subject.toString());
+        var activation = client.hostActivationState(subject.toString());
+
+        assertThat(activation.emailVerified()).isTrue();
+        assertThat(activation.enabled()).isTrue();
+        assertThat(activation.requiredActions()).isEmpty();
+        server.verify();
+    }
+
+    @Test
     void listsActiveSessionsFromKeycloakWithoutPersistingTokens() {
         var builder = RestClient.builder();
         var server = MockRestServiceServer.bindTo(builder).build();
@@ -155,6 +229,53 @@ class KeycloakAdminClientTest {
         server.verify();
     }
 
+    @Test
+    void preservesEmailAndRequiredActionsWhenProjectingTheProfileId() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = client(builder);
+        var accountId = UUID.randomUUID();
+        var profileId = UUID.randomUUID().toString();
+
+        expectServiceToken(server);
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users/" + accountId))
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("""
+                {
+                  "id":"%s",
+                  "username":"admin@vistay.local",
+                  "email":"admin@example.com",
+                  "emailVerified":false,
+                  "enabled":true,
+                  "requiredActions":["VERIFY_EMAIL"],
+                  "attributes":{"vistay_account_type":["ADMIN"]}
+                }
+                """.formatted(accountId), MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users/" + accountId))
+            .andExpect(method(HttpMethod.PUT))
+            .andExpect(content().json("""
+                {
+                  "id":"%s",
+                  "username":"admin@vistay.local",
+                  "email":"admin@example.com",
+                  "emailVerified":false,
+                  "enabled":true,
+                  "requiredActions":["VERIFY_EMAIL"],
+                  "attributes":{
+                    "vistay_account_type":["ADMIN"],
+                    "vistay_profile_id":["%s"]
+                  }
+                }
+                """.formatted(accountId, profileId), JsonCompareMode.STRICT))
+            .andRespond(withSuccess());
+
+        client.setBackofficeProfileId(accountId, profileId);
+
+        server.verify();
+    }
+
     private static KeycloakAdminClient client(RestClient.Builder builder) {
         return new KeycloakAdminClient(
             builder,
@@ -162,6 +283,20 @@ class KeycloakAdminClientTest {
             "vistay-backoffice",
             "vistay-auth-facade",
             "test-secret"
+        );
+    }
+
+    private static KeycloakAdminClient hostClient(RestClient.Builder builder) {
+        return new KeycloakAdminClient(
+            builder,
+            "http://identity.test",
+            "vistay-backoffice",
+            "vistay-auth-facade",
+            "test-secret",
+            "vistay-host",
+            "vistay-host-web",
+            900,
+            "http://host.localhost/oidc/callback"
         );
     }
 

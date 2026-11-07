@@ -9,6 +9,7 @@ import io.grpc.StatusRuntimeException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -44,10 +45,24 @@ public class AuthorizationClient {
     }
 
     public Snapshot require(UUID accountId, String permission) {
+        return requireAnyScope(accountId, permission, "ALL");
+    }
+
+    public Snapshot requireAnyScope(UUID accountId, String permission, String... allowedScopes) {
         var snapshot = requireActive(accountId);
         var scopes = snapshot.grants().get(permission);
-        if (scopes == null || !scopes.contains("ALL")) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Missing permission " + permission + "@ALL");
+        var allowed = false;
+        if (scopes != null) {
+            for (var scope : allowedScopes) {
+                if (scopes.contains(scope)) {
+                    allowed = true;
+                    break;
+                }
+            }
+        }
+        if (!allowed) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,
+                "Missing permission " + permission + "@" + String.join("|", allowedScopes));
         }
         return snapshot;
     }
@@ -82,7 +97,8 @@ public class AuthorizationClient {
                     .map(scope -> scope.name().substring("DATA_SCOPE_TYPE_".length()))
                     .collect(java.util.stream.Collectors.toUnmodifiableSet())));
             var snapshot = new Snapshot(response.getActive(), response.getProfileId(),
-                response.getAuthorizationVersion(), Map.copyOf(grants));
+                response.getAuthorizationVersion(), Map.copyOf(grants),
+                Set.copyOf(new LinkedHashSet<>(response.getRolesList())));
             cache.put(accountId, new CachedSnapshot(snapshot, now.plus(cacheTtl)));
             return snapshot;
         } catch (StatusRuntimeException unavailable) {
@@ -103,11 +119,15 @@ public class AuthorizationClient {
         }
         var accountId = UUID.fromString(data.get("accountId").asString());
         var version = data.get("authorizationVersion").asLong();
-        minimumVersions.merge(accountId, version, Math::max);
+        invalidate(accountId, version);
+    }
+
+    public void invalidate(UUID accountId, long minimumVersion) {
+        minimumVersions.merge(accountId, minimumVersion, Math::max);
         cache.remove(accountId);
     }
 
     private record CachedSnapshot(Snapshot snapshot, Instant expiresAt) {}
     public record Snapshot(boolean active, String profileId, long authorizationVersion,
-        Map<String, Set<String>> grants) {}
+        Map<String, Set<String>> grants, Set<String> roles) {}
 }
