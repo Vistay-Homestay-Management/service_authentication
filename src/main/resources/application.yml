@@ -115,6 +115,7 @@ vistay:
     admin-client-id: ${KEYCLOAK_ADMIN_CLIENT_ID:vistay-auth-facade}
     admin-client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:local-keycloak-client-secret}
     backoffice-api-client-id: ${KEYCLOAK_BACKOFFICE_API_CLIENT_ID:vistay-backoffice-api}
+    backoffice-role-consumer-client-ids: ${KEYCLOAK_BACKOFFICE_ROLE_CONSUMER_CLIENT_IDS:vistay-backoffice-web,vistay-backoffice-mobile,vistay-backoffice-postman}
     host-realm: ${KEYCLOAK_HOST_REALM:vistay-host}
     host-client-id: ${KEYCLOAK_HOST_CLIENT_ID:vistay-host-web}
     host-action-lifespan-seconds: ${KEYCLOAK_HOST_ACTION_LIFESPAN_SECONDS:900}

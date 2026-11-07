@@ -25,6 +25,7 @@ public class KeycloakAdminClient {
     private final String clientId;
     private final String clientSecret;
     private final String backofficeApiClientId;
+    private final List<String> backofficeRoleConsumerClientIds;
     private final String hostRealm;
     private final String hostClientId;
     private final int hostActionLifespanSeconds;
@@ -39,6 +40,8 @@ public class KeycloakAdminClient {
         @Value("${vistay.keycloak.admin-client-id}") String clientId,
         @Value("${vistay.keycloak.admin-client-secret}") String clientSecret,
         @Value("${vistay.keycloak.backoffice-api-client-id:vistay-backoffice-api}") String backofficeApiClientId,
+        @Value("${vistay.keycloak.backoffice-role-consumer-client-ids:vistay-backoffice-web,vistay-backoffice-mobile,vistay-backoffice-postman}")
+        List<String> backofficeRoleConsumerClientIds,
         @Value("${vistay.keycloak.host-realm:vistay-host}") String hostRealm,
         @Value("${vistay.keycloak.host-client-id:vistay-host-web}") String hostClientId,
         @Value("${vistay.keycloak.host-action-lifespan-seconds:900}") int hostActionLifespanSeconds,
@@ -49,6 +52,7 @@ public class KeycloakAdminClient {
         this.clientId = clientId;
         this.clientSecret = clientSecret;
         this.backofficeApiClientId = backofficeApiClientId;
+        this.backofficeRoleConsumerClientIds = List.copyOf(backofficeRoleConsumerClientIds);
         this.hostRealm = hostRealm;
         this.hostClientId = hostClientId;
         this.hostActionLifespanSeconds = hostActionLifespanSeconds;
@@ -63,6 +67,7 @@ public class KeycloakAdminClient {
         String clientSecret
     ) {
         this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
+            defaultBackofficeRoleConsumers(),
             "vistay-host", "vistay-host-web", 900,
             "http://host.localhost/oidc/callback");
     }
@@ -79,6 +84,7 @@ public class KeycloakAdminClient {
         String hostRedirectUri
     ) {
         this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
+            defaultBackofficeRoleConsumers(),
             hostRealm, hostClientId, hostActionLifespanSeconds, hostRedirectUri);
     }
 
@@ -103,6 +109,8 @@ public class KeycloakAdminClient {
             clientRoles(realm, clientUuid).forEach(role -> byName.put(role.name(), role));
         }
 
+        var scopeMappingsChanged = reconcileRoleScopeMappings(clientUuid, desiredRoles, byName);
+
         var current = userClientRoles(accountId, clientUuid);
         var currentNames = current.stream().map(ClientRoleRepresentation::name)
             .collect(java.util.stream.Collectors.toSet());
@@ -125,7 +133,42 @@ public class KeycloakAdminClient {
                 .contentType(MediaType.APPLICATION_JSON).body(removals)
                 .retrieve().toBodilessEntity();
         }
-        return !additions.isEmpty() || !removals.isEmpty();
+        return scopeMappingsChanged || !additions.isEmpty() || !removals.isEmpty();
+    }
+
+    /**
+     * Makes every projected API role visible to the public token clients while
+     * keeping their Keycloak full-scope switch disabled. This is additive on
+     * purpose: another account can still need a role that this account does not.
+     */
+    private boolean reconcileRoleScopeMappings(
+        String apiClientUuid,
+        java.util.Set<String> desiredRoles,
+        Map<String, ClientRoleRepresentation> rolesByName
+    ) {
+        if (desiredRoles.isEmpty()) return false;
+        var changed = false;
+        for (var consumerClientId : backofficeRoleConsumerClientIds) {
+            var consumerUuid = clientUuid(realm, consumerClientId);
+            var currentNames = clientScopeRoles(consumerUuid, apiClientUuid).stream()
+                .map(ClientRoleRepresentation::name)
+                .collect(java.util.stream.Collectors.toSet());
+            var missing = desiredRoles.stream()
+                .filter(role -> !currentNames.contains(role))
+                .map(rolesByName::get)
+                .filter(java.util.Objects::nonNull)
+                .toList();
+            if (missing.isEmpty()) continue;
+            http.post()
+                .uri("/admin/realms/{realm}/clients/{consumerId}/scope-mappings/clients/{apiId}",
+                    realm, consumerUuid, apiClientUuid)
+                .headers(headers -> headers.setBearerAuth(accessToken()))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(missing)
+                .retrieve().toBodilessEntity();
+            changed = true;
+        }
+        return changed;
     }
 
     public void setBackofficeProfileId(UUID accountId, String profileId) {
@@ -182,6 +225,26 @@ public class KeycloakAdminClient {
             .headers(headers -> headers.setBearerAuth(accessToken()))
             .retrieve().body(ClientRoleRepresentation[].class);
         return roles == null ? List.of() : Arrays.asList(roles);
+    }
+
+    private List<ClientRoleRepresentation> clientScopeRoles(
+        String consumerClientUuid,
+        String apiClientUuid
+    ) {
+        var roles = http.get()
+            .uri("/admin/realms/{realm}/clients/{consumerId}/scope-mappings/clients/{apiId}",
+                realm, consumerClientUuid, apiClientUuid)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve().body(ClientRoleRepresentation[].class);
+        return roles == null ? List.of() : Arrays.asList(roles);
+    }
+
+    private static List<String> defaultBackofficeRoleConsumers() {
+        return List.of(
+            "vistay-backoffice-web",
+            "vistay-backoffice-mobile",
+            "vistay-backoffice-postman"
+        );
     }
 
     public String ensureBackofficeUser(
