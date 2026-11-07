@@ -114,6 +114,7 @@ vistay:
     backoffice-realm: ${KEYCLOAK_BACKOFFICE_REALM:vistay-backoffice}
     admin-client-id: ${KEYCLOAK_ADMIN_CLIENT_ID:vistay-auth-facade}
     admin-client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:local-keycloak-client-secret}
+    backoffice-api-client-id: ${KEYCLOAK_BACKOFFICE_API_CLIENT_ID:vistay-backoffice-api}
     host-realm: ${KEYCLOAK_HOST_REALM:vistay-host}
     host-client-id: ${KEYCLOAK_HOST_CLIENT_ID:vistay-host-web}
     host-action-lifespan-seconds: ${KEYCLOAK_HOST_ACTION_LIFESPAN_SECONDS:900}
@@ -128,3 +129,4 @@ vistay:
   authorization:
     local-cache-ttl: ${AUTHORIZATION_LOCAL_CACHE_TTL:30s}
     grpc-deadline: ${AUTHORIZATION_GRPC_DEADLINE:2s}
+    keycloak-reconcile-delay-ms: ${KEYCLOAK_ROLE_RECONCILE_DELAY_MS:300000}

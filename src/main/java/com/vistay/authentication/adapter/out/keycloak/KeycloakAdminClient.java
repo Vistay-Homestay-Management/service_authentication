@@ -9,7 +9,9 @@ import java.util.Map;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedMultiValueMap;
@@ -22,6 +24,7 @@ public class KeycloakAdminClient {
     private final String realm;
     private final String clientId;
     private final String clientSecret;
+    private final String backofficeApiClientId;
     private final String hostRealm;
     private final String hostClientId;
     private final int hostActionLifespanSeconds;
@@ -35,6 +38,7 @@ public class KeycloakAdminClient {
         @Value("${vistay.keycloak.backoffice-realm}") String realm,
         @Value("${vistay.keycloak.admin-client-id}") String clientId,
         @Value("${vistay.keycloak.admin-client-secret}") String clientSecret,
+        @Value("${vistay.keycloak.backoffice-api-client-id:vistay-backoffice-api}") String backofficeApiClientId,
         @Value("${vistay.keycloak.host-realm:vistay-host}") String hostRealm,
         @Value("${vistay.keycloak.host-client-id:vistay-host-web}") String hostClientId,
         @Value("${vistay.keycloak.host-action-lifespan-seconds:900}") int hostActionLifespanSeconds,
@@ -44,6 +48,7 @@ public class KeycloakAdminClient {
         this.realm = realm;
         this.clientId = clientId;
         this.clientSecret = clientSecret;
+        this.backofficeApiClientId = backofficeApiClientId;
         this.hostRealm = hostRealm;
         this.hostClientId = hostClientId;
         this.hostActionLifespanSeconds = hostActionLifespanSeconds;
@@ -57,9 +62,126 @@ public class KeycloakAdminClient {
         String clientId,
         String clientSecret
     ) {
-        this(builder, baseUrl, realm, clientId, clientSecret,
+        this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
             "vistay-host", "vistay-host-web", 900,
             "http://host.localhost/oidc/callback");
+    }
+
+    public KeycloakAdminClient(
+        RestClient.Builder builder,
+        String baseUrl,
+        String realm,
+        String clientId,
+        String clientSecret,
+        String hostRealm,
+        String hostClientId,
+        int hostActionLifespanSeconds,
+        String hostRedirectUri
+    ) {
+        this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
+            hostRealm, hostClientId, hostActionLifespanSeconds, hostRedirectUri);
+    }
+
+    /** Reconciles the exact direct client-role set projected by User Service. */
+    public boolean reconcileBackofficeRoles(UUID accountId, java.util.Set<String> desiredRoles) {
+        var clientUuid = clientUuid(realm, backofficeApiClientId);
+        var available = clientRoles(realm, clientUuid);
+        var byName = new LinkedHashMap<String, ClientRoleRepresentation>();
+        available.forEach(role -> byName.put(role.name(), role));
+        for (var roleCode : desiredRoles) {
+            if (!byName.containsKey(roleCode)) {
+                http.post()
+                    .uri("/admin/realms/{realm}/clients/{clientId}/roles", realm, clientUuid)
+                    .headers(headers -> headers.setBearerAuth(accessToken()))
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(Map.of("name", roleCode, "description", "Projected from ViStay User Service"))
+                    .retrieve().toBodilessEntity();
+            }
+        }
+        if (!desiredRoles.stream().allMatch(byName::containsKey)) {
+            byName.clear();
+            clientRoles(realm, clientUuid).forEach(role -> byName.put(role.name(), role));
+        }
+
+        var current = userClientRoles(accountId, clientUuid);
+        var currentNames = current.stream().map(ClientRoleRepresentation::name)
+            .collect(java.util.stream.Collectors.toSet());
+        var additions = desiredRoles.stream().filter(role -> !currentNames.contains(role))
+            .map(byName::get).filter(java.util.Objects::nonNull).toList();
+        var removals = current.stream().filter(role -> !desiredRoles.contains(role.name())).toList();
+        if (!additions.isEmpty()) {
+            http.post()
+                .uri("/admin/realms/{realm}/users/{userId}/role-mappings/clients/{clientId}",
+                    realm, accountId, clientUuid)
+                .headers(headers -> headers.setBearerAuth(accessToken()))
+                .contentType(MediaType.APPLICATION_JSON).body(additions)
+                .retrieve().toBodilessEntity();
+        }
+        if (!removals.isEmpty()) {
+            http.method(HttpMethod.DELETE)
+                .uri("/admin/realms/{realm}/users/{userId}/role-mappings/clients/{clientId}",
+                    realm, accountId, clientUuid)
+                .headers(headers -> headers.setBearerAuth(accessToken()))
+                .contentType(MediaType.APPLICATION_JSON).body(removals)
+                .retrieve().toBodilessEntity();
+        }
+        return !additions.isEmpty() || !removals.isEmpty();
+    }
+
+    public void setBackofficeProfileId(UUID accountId, String profileId) {
+        var user = http.get()
+            .uri("/admin/realms/{realm}/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve().body(new ParameterizedTypeReference<LinkedHashMap<String, Object>>() {});
+        if (user == null) throw new IllegalStateException("Keycloak user was not found");
+        var attributes = new LinkedHashMap<String, Object>();
+        if (user.get("attributes") instanceof Map<?, ?> currentAttributes) {
+            currentAttributes.forEach((key, value) -> {
+                if (key instanceof String attributeName) {
+                    attributes.put(attributeName, value);
+                }
+            });
+        }
+        if (List.of(profileId).equals(attributes.get("vistay_profile_id"))) return;
+        attributes.put("vistay_profile_id", List.of(profileId));
+        user.put("attributes", attributes);
+        http.put()
+            .uri("/admin/realms/{realm}/users/{userId}", realm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .contentType(MediaType.APPLICATION_JSON)
+            // Keycloak's PUT user endpoint replaces omitted profile fields. Send the
+            // full representation returned by GET so email and required actions survive.
+            .body(user)
+            .retrieve().toBodilessEntity();
+    }
+
+    private String clientUuid(String targetRealm, String targetClientId) {
+        var clients = http.get()
+            .uri(uri -> uri.path("/admin/realms/{realm}/clients")
+                .queryParam("clientId", targetClientId).build(targetRealm))
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve().body(ClientRepresentation[].class);
+        if (clients == null || clients.length != 1) {
+            throw new IllegalStateException("Keycloak API client was not found uniquely: " + targetClientId);
+        }
+        return clients[0].id();
+    }
+
+    private List<ClientRoleRepresentation> clientRoles(String targetRealm, String clientUuid) {
+        var roles = http.get()
+            .uri("/admin/realms/{realm}/clients/{clientId}/roles", targetRealm, clientUuid)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve().body(ClientRoleRepresentation[].class);
+        return roles == null ? List.of() : Arrays.asList(roles);
+    }
+
+    private List<ClientRoleRepresentation> userClientRoles(UUID accountId, String clientUuid) {
+        var roles = http.get()
+            .uri("/admin/realms/{realm}/users/{userId}/role-mappings/clients/{clientId}",
+                realm, accountId, clientUuid)
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .retrieve().body(ClientRoleRepresentation[].class);
+        return roles == null ? List.of() : Arrays.asList(roles);
     }
 
     public String ensureBackofficeUser(
@@ -359,6 +481,8 @@ public class KeycloakAdminClient {
         long lastAccess,
         Map<String, String> clients
     ) {}
+    private record ClientRepresentation(String id, String clientId) {}
+    private record ClientRoleRepresentation(String id, String name, String description) {}
     private record CredentialRepresentation(String type, String value, boolean temporary) {}
     private record UserRepresentation(
         String username,

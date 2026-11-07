@@ -229,6 +229,53 @@ class KeycloakAdminClientTest {
         server.verify();
     }
 
+    @Test
+    void preservesEmailAndRequiredActionsWhenProjectingTheProfileId() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = client(builder);
+        var accountId = UUID.randomUUID();
+        var profileId = UUID.randomUUID().toString();
+
+        expectServiceToken(server);
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users/" + accountId))
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("""
+                {
+                  "id":"%s",
+                  "username":"admin@vistay.local",
+                  "email":"admin@example.com",
+                  "emailVerified":false,
+                  "enabled":true,
+                  "requiredActions":["VERIFY_EMAIL"],
+                  "attributes":{"vistay_account_type":["ADMIN"]}
+                }
+                """.formatted(accountId), MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users/" + accountId))
+            .andExpect(method(HttpMethod.PUT))
+            .andExpect(content().json("""
+                {
+                  "id":"%s",
+                  "username":"admin@vistay.local",
+                  "email":"admin@example.com",
+                  "emailVerified":false,
+                  "enabled":true,
+                  "requiredActions":["VERIFY_EMAIL"],
+                  "attributes":{
+                    "vistay_account_type":["ADMIN"],
+                    "vistay_profile_id":["%s"]
+                  }
+                }
+                """.formatted(accountId, profileId), JsonCompareMode.STRICT))
+            .andRespond(withSuccess());
+
+        client.setBackofficeProfileId(accountId, profileId);
+
+        server.verify();
+    }
+
     private static KeycloakAdminClient client(RestClient.Builder builder) {
         return new KeycloakAdminClient(
             builder,
