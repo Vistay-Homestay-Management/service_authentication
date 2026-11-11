@@ -116,7 +116,7 @@ class KeycloakAdminClientTest {
         var invitationId = UUID.randomUUID();
         var subject = UUID.randomUUID();
 
-        expectServiceToken(server);
+        expectServiceToken(server, "vistay-host");
         server.expect(once(), request -> {
                 assertThat(request.getURI().getPath())
                     .isEqualTo("/admin/realms/vistay-host/users");
@@ -332,6 +332,43 @@ class KeycloakAdminClientTest {
         server.verify();
     }
 
+    @Test
+    void usesRealmLocalServiceAccountWhenProjectingCustomerProfileId() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = client(builder);
+        var accountId = UUID.randomUUID();
+        var profileId = UUID.randomUUID().toString();
+
+        expectServiceToken(server, "vistay-customer");
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-customer/users/" + accountId))
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("""
+                {
+                  "id":"%s","username":"customer@vistay.test",
+                  "email":"customer@vistay.test","emailVerified":true,"enabled":true,
+                  "requiredActions":[],"attributes":{"vistay_account_type":["CUSTOMER"]}
+                }
+                """.formatted(accountId), MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-customer/users/" + accountId))
+            .andExpect(method(HttpMethod.PUT))
+            .andExpect(content().json("""
+                {
+                  "id":"%s","username":"customer@vistay.test",
+                  "email":"customer@vistay.test","emailVerified":true,"enabled":true,
+                  "requiredActions":[],
+                  "attributes":{"vistay_account_type":["CUSTOMER"],"vistay_profile_id":["%s"]}
+                }
+                """.formatted(accountId, profileId), JsonCompareMode.STRICT))
+            .andRespond(withSuccess());
+
+        client.setProfileId("CUSTOMER", accountId, profileId);
+
+        server.verify();
+    }
+
     private static KeycloakAdminClient client(RestClient.Builder builder) {
         return new KeycloakAdminClient(
             builder,
@@ -357,8 +394,12 @@ class KeycloakAdminClientTest {
     }
 
     private static void expectServiceToken(MockRestServiceServer server) {
+        expectServiceToken(server, "vistay-backoffice");
+    }
+
+    private static void expectServiceToken(MockRestServiceServer server, String realm) {
         server.expect(once(), request -> assertThat(request.getURI().getPath())
-                .isEqualTo("/realms/vistay-backoffice/protocol/openid-connect/token"))
+                .isEqualTo("/realms/" + realm + "/protocol/openid-connect/token"))
             .andExpect(method(HttpMethod.POST))
             .andRespond(withSuccess("{\"access_token\":\"service-token\",\"expires_in\":300}",
                 MediaType.APPLICATION_JSON));

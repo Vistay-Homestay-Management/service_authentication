@@ -7,6 +7,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
@@ -27,10 +28,11 @@ public class KeycloakAdminClient {
     private final String backofficeApiClientId;
     private final List<String> backofficeRoleConsumerClientIds;
     private final String hostRealm;
+    private final String customerRealm;
     private final String hostClientId;
     private final int hostActionLifespanSeconds;
     private final String hostRedirectUri;
-    private volatile CachedToken cachedToken;
+    private final Map<String, CachedToken> cachedTokens = new ConcurrentHashMap<>();
 
     @Autowired
     public KeycloakAdminClient(
@@ -43,6 +45,7 @@ public class KeycloakAdminClient {
         @Value("${vistay.keycloak.backoffice-role-consumer-client-ids:vistay-backoffice-web,vistay-backoffice-mobile,vistay-backoffice-postman}")
         List<String> backofficeRoleConsumerClientIds,
         @Value("${vistay.keycloak.host-realm:vistay-host}") String hostRealm,
+        @Value("${vistay.keycloak.customer-realm:vistay-customer}") String customerRealm,
         @Value("${vistay.keycloak.host-client-id:vistay-host-web}") String hostClientId,
         @Value("${vistay.keycloak.host-action-lifespan-seconds:900}") int hostActionLifespanSeconds,
         @Value("${vistay.keycloak.host-redirect-uri:http://host.localhost/oidc/callback}") String hostRedirectUri
@@ -54,6 +57,7 @@ public class KeycloakAdminClient {
         this.backofficeApiClientId = backofficeApiClientId;
         this.backofficeRoleConsumerClientIds = List.copyOf(backofficeRoleConsumerClientIds);
         this.hostRealm = hostRealm;
+        this.customerRealm = customerRealm;
         this.hostClientId = hostClientId;
         this.hostActionLifespanSeconds = hostActionLifespanSeconds;
         this.hostRedirectUri = hostRedirectUri;
@@ -68,7 +72,7 @@ public class KeycloakAdminClient {
     ) {
         this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
             defaultBackofficeRoleConsumers(),
-            "vistay-host", "vistay-host-web", 900,
+            "vistay-host", "vistay-customer", "vistay-host-web", 900,
             "http://host.localhost/oidc/callback");
     }
 
@@ -85,7 +89,7 @@ public class KeycloakAdminClient {
     ) {
         this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
             defaultBackofficeRoleConsumers(),
-            hostRealm, hostClientId, hostActionLifespanSeconds, hostRedirectUri);
+            hostRealm, "vistay-customer", hostClientId, hostActionLifespanSeconds, hostRedirectUri);
     }
 
     /** Reconciles the exact direct client-role set projected by User Service. */
@@ -172,9 +176,14 @@ public class KeycloakAdminClient {
     }
 
     public void setBackofficeProfileId(UUID accountId, String profileId) {
+        setProfileId("ADMIN", accountId, profileId);
+    }
+
+    public void setProfileId(String accountType, UUID accountId, String profileId) {
+        var targetRealm = realmFor(accountType);
         var user = http.get()
-            .uri("/admin/realms/{realm}/users/{userId}", realm, accountId)
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .uri("/admin/realms/{realm}/users/{userId}", targetRealm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
             .retrieve().body(new ParameterizedTypeReference<LinkedHashMap<String, Object>>() {});
         if (user == null) throw new IllegalStateException("Keycloak user was not found");
         var attributes = new LinkedHashMap<String, Object>();
@@ -189,8 +198,8 @@ public class KeycloakAdminClient {
         attributes.put("vistay_profile_id", List.of(profileId));
         user.put("attributes", attributes);
         http.put()
-            .uri("/admin/realms/{realm}/users/{userId}", realm, accountId)
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .uri("/admin/realms/{realm}/users/{userId}", targetRealm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
             .contentType(MediaType.APPLICATION_JSON)
             // Keycloak's PUT user endpoint replaces omitted profile fields. Send the
             // full representation returned by GET so email and required actions survive.
@@ -202,7 +211,7 @@ public class KeycloakAdminClient {
         var clients = http.get()
             .uri(uri -> uri.path("/admin/realms/{realm}/clients")
                 .queryParam("clientId", targetClientId).build(targetRealm))
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
             .retrieve().body(ClientRepresentation[].class);
         if (clients == null || clients.length != 1) {
             throw new IllegalStateException("Keycloak API client was not found uniquely: " + targetClientId);
@@ -213,7 +222,7 @@ public class KeycloakAdminClient {
     private List<ClientRoleRepresentation> clientRoles(String targetRealm, String clientUuid) {
         var roles = http.get()
             .uri("/admin/realms/{realm}/clients/{clientId}/roles", targetRealm, clientUuid)
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
             .retrieve().body(ClientRoleRepresentation[].class);
         return roles == null ? List.of() : Arrays.asList(roles);
     }
@@ -325,7 +334,7 @@ public class KeycloakAdminClient {
         try {
             var response = http.post()
                 .uri("/admin/realms/{realm}/users", hostRealm)
-                .headers(headers -> headers.setBearerAuth(accessToken()))
+                .headers(headers -> headers.setBearerAuth(accessToken(hostRealm)))
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(representation)
                 .retrieve()
@@ -348,7 +357,7 @@ public class KeycloakAdminClient {
                 .queryParam("client_id", hostClientId)
                 .queryParam("redirect_uri", hostRedirectUri)
                 .build(hostRealm, subject))
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .headers(headers -> headers.setBearerAuth(accessToken(hostRealm)))
             .contentType(MediaType.APPLICATION_JSON)
             .body(List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"))
             .retrieve()
@@ -358,7 +367,7 @@ public class KeycloakAdminClient {
     public HostActivationState hostActivationState(String subject) {
         var user = http.get()
             .uri("/admin/realms/{realm}/users/{userId}", hostRealm, subject)
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .headers(headers -> headers.setBearerAuth(accessToken(hostRealm)))
             .retrieve()
             .body(UserSummary.class);
         if (user == null) {
@@ -410,11 +419,43 @@ public class KeycloakAdminClient {
     }
 
     public void logoutUser(UUID accountId) {
+        logoutUser("ADMIN", accountId);
+    }
+
+    public void logoutUser(String accountType, UUID accountId) {
+        var targetRealm = realmFor(accountType);
         http.post()
-            .uri("/admin/realms/{realm}/users/{userId}/logout", realm, accountId)
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .uri("/admin/realms/{realm}/users/{userId}/logout", targetRealm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
             .retrieve()
             .toBodilessEntity();
+    }
+
+    public void disableAndDeleteUser(String accountType, UUID accountId) {
+        var targetRealm = realmFor(accountType);
+        http.put()
+            .uri("/admin/realms/{realm}/users/{userId}", targetRealm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of("enabled", false))
+            .retrieve().toBodilessEntity();
+        http.post()
+            .uri("/admin/realms/{realm}/users/{userId}/logout", targetRealm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+            .retrieve().toBodilessEntity();
+        http.delete()
+            .uri("/admin/realms/{realm}/users/{userId}", targetRealm, accountId)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+            .retrieve().toBodilessEntity();
+    }
+
+    private String realmFor(String accountType) {
+        return switch (accountType) {
+            case "ADMIN" -> realm;
+            case "HOST" -> hostRealm;
+            case "CUSTOMER" -> customerRealm;
+            default -> throw new IllegalArgumentException("Unsupported account type: " + accountType);
+        };
     }
 
     public void clearUserLoginFailures(UUID accountId) {
@@ -446,7 +487,7 @@ public class KeycloakAdminClient {
                 .queryParam("exact", true)
                 .queryParam("max", 2)
                 .build(targetRealm))
-            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
             .retrieve()
             .body(UserSummary[].class);
         if (users == null || users.length == 0) {
@@ -474,12 +515,16 @@ public class KeycloakAdminClient {
     }
 
     private String accessToken() {
-        var snapshot = cachedToken;
+        return accessToken(realm);
+    }
+
+    private String accessToken(String tokenRealm) {
+        var snapshot = cachedTokens.get(tokenRealm);
         if (snapshot != null && snapshot.expiresAt().isAfter(Instant.now().plusSeconds(15))) {
             return snapshot.value();
         }
         synchronized (this) {
-            snapshot = cachedToken;
+            snapshot = cachedTokens.get(tokenRealm);
             if (snapshot != null && snapshot.expiresAt().isAfter(Instant.now().plusSeconds(15))) {
                 return snapshot.value();
             }
@@ -488,7 +533,7 @@ public class KeycloakAdminClient {
             form.add("client_id", clientId);
             form.add("client_secret", clientSecret);
             var response = http.post()
-                .uri("/realms/{realm}/protocol/openid-connect/token", realm)
+                .uri("/realms/{realm}/protocol/openid-connect/token", tokenRealm)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(form)
                 .retrieve()
@@ -496,11 +541,12 @@ public class KeycloakAdminClient {
             if (response == null || response.accessToken() == null) {
                 throw new IllegalStateException("Keycloak did not return a service-account token");
             }
-            cachedToken = new CachedToken(
+            var refreshed = new CachedToken(
                 response.accessToken(),
                 Instant.now().plusSeconds(Math.max(response.expiresIn(), 30))
             );
-            return cachedToken.value();
+            cachedTokens.put(tokenRealm, refreshed);
+            return refreshed.value();
         }
     }
 
