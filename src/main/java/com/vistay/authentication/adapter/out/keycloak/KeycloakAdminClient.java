@@ -35,6 +35,12 @@ public class KeycloakAdminClient {
     private final String hostClientId;
     private final int hostActionLifespanSeconds;
     private final String hostRedirectUri;
+    @Value("${vistay.keycloak.customer-client-id:vistay-customer-web}")
+    private String customerClientId = "vistay-customer-web";
+    @Value("${vistay.keycloak.customer-action-lifespan-seconds:900}")
+    private int customerActionLifespanSeconds = 900;
+    @Value("${vistay.keycloak.customer-redirect-uri:http://customer.localhost/oidc/callback}")
+    private String customerRedirectUri = "http://customer.localhost/oidc/callback";
     private final Map<String, CachedToken> cachedTokens = new ConcurrentHashMap<>();
 
     @Autowired
@@ -215,6 +221,20 @@ public class KeycloakAdminClient {
             // Keycloak's PUT user endpoint replaces omitted profile fields. Send the
             // full representation returned by GET so email and required actions survive.
             .body(user)
+            .retrieve().toBodilessEntity();
+    }
+
+    /** Projects the User-owned public registration switch to one portal realm. */
+    public void setRegistrationEnabled(String accountType, boolean enabled) {
+        var targetRealm = realmFor(accountType);
+        http.put()
+            .uri("/admin/realms/{realm}", targetRealm)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of(
+                "registrationAllowed", enabled,
+                "verifyEmail", true
+            ))
             .retrieve().toBodilessEntity();
     }
 
@@ -432,6 +452,88 @@ public class KeycloakAdminClient {
             .body(List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"))
             .retrieve()
             .toBodilessEntity();
+    }
+
+    /** Creates an account for a known profile without bypassing the profile-link proof flow. */
+    public String ensureProfileAccount(
+        String accountType,
+        String email,
+        String fullName,
+        String temporaryPassword,
+        UUID requestId,
+        UUID targetProfileId
+    ) {
+        var targetRealm = realmFor(accountType);
+        var existing = findExactUserByEmail(targetRealm, email);
+        if (existing != null) {
+            var request = firstAttribute(existing.attributes(), "vistay_profile_account_request_id");
+            if (!requestId.toString().equals(request)) throw new ProfileAccountCollisionException();
+            return existing.id();
+        }
+
+        var invitation = temporaryPassword == null || temporaryPassword.isBlank();
+        var name = splitName(fullName);
+        var requiredActions = invitation
+            ? List.of("VERIFY_EMAIL", "UPDATE_PASSWORD")
+            : List.of("UPDATE_PASSWORD");
+        var credentials = invitation
+            ? List.<CredentialRepresentation>of()
+            : List.of(new CredentialRepresentation("password", temporaryPassword, true));
+        var representation = new UserRepresentation(
+            email, email, name.firstName(), name.lastName(), true, !invitation,
+            requiredActions, credentials,
+            Map.of(
+                "vistay_account_type", List.of(accountType),
+                "vistay_profile_account_request_id", List.of(requestId.toString()),
+                "vistay_target_profile_id", List.of(targetProfileId.toString())
+            )
+        );
+        try {
+            var response = http.post()
+                .uri("/admin/realms/{realm}/users", targetRealm)
+                .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(representation)
+                .retrieve().toBodilessEntity();
+            return subjectFromLocation(response.getHeaders().getLocation());
+        } catch (HttpClientErrorException.Conflict duplicate) {
+            var concurrent = findExactUserByEmail(targetRealm, email);
+            if (concurrent != null && requestId.toString().equals(firstAttribute(
+                concurrent.attributes(), "vistay_profile_account_request_id"))) {
+                return concurrent.id();
+            }
+            throw new ProfileAccountCollisionException();
+        }
+    }
+
+    public void sendProfileAccountActivationEmail(String accountType, String subject) {
+        var targetRealm = realmFor(accountType);
+        var client = switch (accountType) {
+            case "ADMIN" -> backofficeClientId;
+            case "HOST" -> hostClientId;
+            case "CUSTOMER" -> customerClientId;
+            default -> throw new IllegalArgumentException("Unsupported account type: " + accountType);
+        };
+        var lifespan = switch (accountType) {
+            case "ADMIN" -> backofficeActionLifespanSeconds;
+            case "HOST" -> hostActionLifespanSeconds;
+            case "CUSTOMER" -> customerActionLifespanSeconds;
+            default -> throw new IllegalArgumentException("Unsupported account type: " + accountType);
+        };
+        var redirect = switch (accountType) {
+            case "ADMIN" -> backofficeRedirectUri;
+            case "HOST" -> hostRedirectUri;
+            case "CUSTOMER" -> customerRedirectUri;
+            default -> throw new IllegalArgumentException("Unsupported account type: " + accountType);
+        };
+        http.put()
+            .uri(uri -> uri.path("/admin/realms/{realm}/users/{userId}/execute-actions-email")
+                .queryParam("lifespan", lifespan).queryParam("client_id", client)
+                .queryParam("redirect_uri", redirect).build(targetRealm, subject))
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"))
+            .retrieve().toBodilessEntity();
     }
 
     public HostActivationState hostActivationState(String subject) {
@@ -719,6 +821,12 @@ public class KeycloakAdminClient {
     public static final class HostSubjectCollisionException extends RuntimeException {
         public HostSubjectCollisionException() {
             super("HOST_SUBJECT_COLLISION");
+        }
+    }
+
+    public static final class ProfileAccountCollisionException extends RuntimeException {
+        public ProfileAccountCollisionException() {
+            super("PROFILE_ACCOUNT_ALREADY_EXISTS");
         }
     }
 }
