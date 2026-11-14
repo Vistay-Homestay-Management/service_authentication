@@ -5,6 +5,7 @@ import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient.Active
 import com.vistay.authentication.adapter.out.keycloak.KeycloakAdminClient.BruteForceStatus;
 import com.vistay.authentication.application.AccountLifecycleService.LifecycleAction;
 import java.time.Instant;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -48,6 +49,7 @@ class AuthServiceIntegrationTest {
     private AuthService service;
     private SessionService sessionService;
     private AccountLifecycleService lifecycleService;
+    private ProfileLinkAccountLifecycleService profileLinkLifecycleService;
 
     @BeforeAll
     static void migrate() {
@@ -70,12 +72,48 @@ class AuthServiceIntegrationTest {
 
     @BeforeEach
     void setUp() {
-        jdbc.sql("TRUNCATE TABLE outbox_events, provisioning_requests, identity_accounts CASCADE")
+        jdbc.sql("""
+            TRUNCATE TABLE consumer_event_receipts, pending_profile_link_completions,
+                outbox_events, provisioning_requests, identity_accounts CASCADE
+            """)
             .update();
         reset(keycloak);
         service = new AuthService(jdbc, keycloak, JsonMapper.builder().build(), transactions);
         sessionService = new SessionService(jdbc, keycloak, transactions);
         lifecycleService = new AccountLifecycleService(jdbc, keycloak, transactions);
+        profileLinkLifecycleService = new ProfileLinkAccountLifecycleService(
+            jdbc, JsonMapper.builder().build(), keycloak, Duration.ofDays(7), Duration.ofHours(72));
+    }
+
+    @Test
+    void projectsRequestedThenLinkedProfileLifecycleExactlyOnce() throws Exception {
+        var accountId = UUID.randomUUID();
+        var profileId = UUID.randomUUID();
+
+        profileLinkLifecycleService.consume(profileLinkRequestedEvent(accountId));
+        profileLinkLifecycleService.consume(profileLinkedEvent(accountId, profileId));
+        profileLinkLifecycleService.consume(profileLinkedEvent(accountId, profileId));
+
+        assertThat(profileProjection(accountId)).isEqualTo("ACTIVE|" + profileId);
+        assertThat(count("consumer_event_receipts")).isEqualTo(2);
+        verify(keycloak, times(1)).setProfileId("CUSTOMER", accountId, profileId.toString());
+        verify(keycloak, times(1)).logoutUser("CUSTOMER", accountId);
+    }
+
+    @Test
+    void buffersLinkedEventThatArrivesBeforeRequestedProjection() throws Exception {
+        var accountId = UUID.randomUUID();
+        var profileId = UUID.randomUUID();
+
+        profileLinkLifecycleService.consume(profileLinkedEvent(accountId, profileId));
+        assertThat(count("pending_profile_link_completions")).isEqualTo(1);
+
+        profileLinkLifecycleService.consume(profileLinkRequestedEvent(accountId));
+
+        assertThat(profileProjection(accountId)).isEqualTo("ACTIVE|" + profileId);
+        assertThat(count("pending_profile_link_completions")).isZero();
+        verify(keycloak).setProfileId("CUSTOMER", accountId, profileId.toString());
+        verify(keycloak).logoutUser("CUSTOMER", accountId);
     }
 
     @Test
@@ -337,6 +375,39 @@ class AuthServiceIntegrationTest {
 
     private long count(String table) {
         return jdbc.sql("SELECT count(*) FROM " + table).query(Long.class).single();
+    }
+
+    private String profileProjection(UUID accountId) {
+        return jdbc.sql("""
+            SELECT status || '|' || profile_id::text
+            FROM identity_accounts WHERE id = :accountId
+            """).param("accountId", accountId).query(String.class).single();
+    }
+
+    private String profileLinkRequestedEvent(UUID accountId) {
+        return """
+            {
+              "eventId":"%s","type":"vistay.user.profile-link-requested","version":1,
+              "aggregateId":"%s","aggregateVersion":1,"correlationId":"test",
+              "causationId":"test","occurredAt":"2026-11-11T00:00:00Z",
+              "data":{"accountId":"%s","accountType":"CUSTOMER",
+                "email":"profile-link@vistay.test","requestedAt":"2026-11-11T00:00:00Z"}
+            }
+            """.formatted(UUID.nameUUIDFromBytes(("requested:" + accountId).getBytes()),
+                accountId, accountId);
+    }
+
+    private String profileLinkedEvent(UUID accountId, UUID profileId) {
+        return """
+            {
+              "eventId":"%s","type":"vistay.user.profile-linked","version":1,
+              "aggregateId":"%s","aggregateVersion":2,"correlationId":"test",
+              "causationId":"test","occurredAt":"2026-11-11T00:00:01Z",
+              "data":{"linkId":"%s","profileId":"%s","accountId":"%s",
+                "profileType":"CUSTOMER","authorizationVersion":1}
+            }
+            """.formatted(UUID.nameUUIDFromBytes(("linked:" + accountId).getBytes()),
+                profileId, UUID.randomUUID(), profileId, accountId);
     }
 
     private void ensureActor(UUID actorId) {
