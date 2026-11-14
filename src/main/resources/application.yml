@@ -124,6 +124,9 @@ vistay:
     host-client-id: ${KEYCLOAK_HOST_CLIENT_ID:vistay-host-web}
     host-action-lifespan-seconds: ${KEYCLOAK_HOST_ACTION_LIFESPAN_SECONDS:900}
     host-redirect-uri: ${VISTAY_HOST_WEB_REDIRECT_URI:http://host.localhost/oidc/callback}
+    customer-client-id: ${KEYCLOAK_CUSTOMER_CLIENT_ID:vistay-customer-web}
+    customer-action-lifespan-seconds: ${KEYCLOAK_CUSTOMER_ACTION_LIFESPAN_SECONDS:900}
+    customer-redirect-uri: ${VISTAY_CUSTOMER_WEB_REDIRECT_URI:http://customer.localhost/oidc/callback}
   host-invitation:
     ttl: ${HOST_INVITATION_TTL:PT24H}
   backoffice-invitation:
@@ -135,10 +138,13 @@ vistay:
     authorization-changed: ${AUTHORIZATION_CHANGED_TOPIC:vistay.user.authorization-changed.v1}
     profile-link-requested: ${PROFILE_LINK_REQUESTED_TOPIC:vistay.user.profile-link-requested.v1}
     profile-linked: ${PROFILE_LINKED_TOPIC:vistay.user.profile-linked.v1}
+    identity-policy-changed: ${IDENTITY_POLICY_CHANGED_TOPIC:vistay.user.identity-policy-changed.v1}
   profile-link:
     pending-reconcile-delay-ms: ${PROFILE_LINK_PENDING_RECONCILE_DELAY_MS:60000}
     host-deadline: ${HOST_PROFILE_LINK_DEADLINE:PT168H}
     admin-deadline: ${ADMIN_PROFILE_LINK_DEADLINE:PT72H}
+  profile-account:
+    invitation-ttl: ${PROFILE_ACCOUNT_INVITATION_TTL:PT24H}
   authorization:
     local-cache-ttl: ${AUTHORIZATION_LOCAL_CACHE_TTL:30s}
     grpc-deadline: ${AUTHORIZATION_GRPC_DEADLINE:2s}
