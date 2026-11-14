@@ -9,6 +9,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,6 +31,7 @@ import tools.jackson.databind.json.JsonMapper;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -47,6 +51,7 @@ class AuthServiceIntegrationTest {
 
     private final KeycloakAdminClient keycloak = mock(KeycloakAdminClient.class);
     private AuthService service;
+    private BackofficeInvitationService invitationService;
     private SessionService sessionService;
     private AccountLifecycleService lifecycleService;
     private ProfileLinkAccountLifecycleService profileLinkLifecycleService;
@@ -79,6 +84,9 @@ class AuthServiceIntegrationTest {
             .update();
         reset(keycloak);
         service = new AuthService(jdbc, keycloak, JsonMapper.builder().build(), transactions);
+        invitationService = new BackofficeInvitationService(
+            jdbc, keycloak, JsonMapper.builder().build(), transactions
+        );
         sessionService = new SessionService(jdbc, keycloak, transactions);
         lifecycleService = new AccountLifecycleService(jdbc, keycloak, transactions);
         profileLinkLifecycleService = new ProfileLinkAccountLifecycleService(
@@ -224,6 +232,111 @@ class AuthServiceIntegrationTest {
             });
         assertThat(count("provisioning_requests")).isZero();
         assertThat(count("outbox_events")).isZero();
+    }
+
+    @Test
+    void invitesEmployeeAndReplaysWithoutSendingDuplicateEmailOrEvent() {
+        var actorId = UUID.randomUUID();
+        var subject = UUID.randomUUID();
+        ensureActor(actorId);
+        when(keycloak.ensureBackofficeInvitedUser(
+            eq("employee@vistay.vn"), eq("ViStay Employee"), anyUuid()
+        )).thenReturn(subject.toString());
+
+        var first = invitationService.invite(
+            "invite-employee-1", actorId, "Employee@ViStay.vn", "ViStay Employee",
+            "Mời nhân viên vận hành mới", UUID.randomUUID().toString()
+        );
+        var replay = invitationService.invite(
+            "invite-employee-1", actorId, "employee@vistay.vn", "ViStay Employee",
+            "Mời nhân viên vận hành mới", UUID.randomUUID().toString()
+        );
+
+        assertThat(first.accountId()).isEqualTo(subject);
+        assertThat(first.deliveryStatus()).isEqualTo("SENT");
+        assertThat(first.replayed()).isFalse();
+        assertThat(replay.replayed()).isTrue();
+        verify(keycloak, times(1)).ensureBackofficeInvitedUser(
+            eq("employee@vistay.vn"), eq("ViStay Employee"), anyUuid()
+        );
+        verify(keycloak, times(1)).sendBackofficeActivationEmail(subject.toString());
+        assertThat(count("backoffice_account_invitations")).isEqualTo(1);
+        assertThat(count("outbox_events")).isEqualTo(1);
+    }
+
+    @Test
+    void keepsRetryableInvitationWhenEmailDispatchIsUnavailable() {
+        var actorId = UUID.randomUUID();
+        var subject = UUID.randomUUID();
+        ensureActor(actorId);
+        when(keycloak.ensureBackofficeInvitedUser(
+            eq("retry-mail@vistay.vn"), eq("Retry Mail"), anyUuid()
+        )).thenReturn(subject.toString());
+        doThrow(new ResourceAccessException("SMTP unavailable"))
+            .doNothing()
+            .when(keycloak).sendBackofficeActivationEmail(subject.toString());
+
+        assertThatThrownBy(() -> invitationService.invite(
+            "invite-retry-mail", actorId, "retry-mail@vistay.vn", "Retry Mail",
+            "Mời nhân viên bằng email", UUID.randomUUID().toString()
+        )).isInstanceOfSatisfying(ResponseStatusException.class, error -> {
+            assertThat(error.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+            assertThat(error.getReason()).isEqualTo("BACKOFFICE_INVITATION_DISPATCH_UNAVAILABLE");
+        });
+
+        var retry = invitationService.invite(
+            "invite-retry-mail", actorId, "retry-mail@vistay.vn", "Retry Mail",
+            "Mời nhân viên bằng email", UUID.randomUUID().toString()
+        );
+        assertThat(retry.deliveryStatus()).isEqualTo("SENT");
+        assertThat(retry.replayed()).isTrue();
+        verify(keycloak, times(2)).sendBackofficeActivationEmail(subject.toString());
+        assertThat(count("outbox_events")).isEqualTo(1);
+    }
+
+    @Test
+    void serializesConcurrentInvitationRetriesToOneEmailDispatch() throws Exception {
+        var actorId = UUID.randomUUID();
+        var subject = UUID.randomUUID();
+        ensureActor(actorId);
+        when(keycloak.ensureBackofficeInvitedUser(
+            eq("concurrent-mail@vistay.vn"), eq("Concurrent Mail"), anyUuid()
+        )).thenReturn(subject.toString());
+        doThrow(new ResourceAccessException("SMTP unavailable"))
+            .when(keycloak).sendBackofficeActivationEmail(subject.toString());
+
+        assertThatThrownBy(() -> invitationService.invite(
+            "invite-concurrent-mail", actorId, "concurrent-mail@vistay.vn", "Concurrent Mail",
+            "Invite an operations employee", UUID.randomUUID().toString()
+        )).isInstanceOf(ResponseStatusException.class);
+
+        var concurrentDispatches = new CountDownLatch(2);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            concurrentDispatches.countDown();
+            concurrentDispatches.await(500, TimeUnit.MILLISECONDS);
+            return null;
+        }).when(keycloak).sendBackofficeActivationEmail(subject.toString());
+
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            var first = executor.submit(() -> invitationService.invite(
+                "invite-concurrent-mail", actorId, "concurrent-mail@vistay.vn", "Concurrent Mail",
+                "Invite an operations employee", UUID.randomUUID().toString()
+            ));
+            var second = executor.submit(() -> invitationService.invite(
+                "invite-concurrent-mail", actorId, "concurrent-mail@vistay.vn", "Concurrent Mail",
+                "Invite an operations employee", UUID.randomUUID().toString()
+            ));
+
+            assertThat(first.get(5, TimeUnit.SECONDS).replayed()).isTrue();
+            assertThat(second.get(5, TimeUnit.SECONDS).replayed()).isTrue();
+        } finally {
+            executor.shutdownNow();
+        }
+
+        verify(keycloak, times(2)).sendBackofficeActivationEmail(subject.toString());
+        assertThat(count("backoffice_account_invitations")).isEqualTo(1);
+        assertThat(count("outbox_events")).isEqualTo(1);
     }
 
     @Test

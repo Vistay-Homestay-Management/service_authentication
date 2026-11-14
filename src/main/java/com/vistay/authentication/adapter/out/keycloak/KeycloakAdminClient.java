@@ -27,11 +27,20 @@ public class KeycloakAdminClient {
     private final String clientSecret;
     private final String backofficeApiClientId;
     private final List<String> backofficeRoleConsumerClientIds;
+    private final String backofficeClientId;
+    private final int backofficeActionLifespanSeconds;
+    private final String backofficeRedirectUri;
     private final String hostRealm;
     private final String customerRealm;
     private final String hostClientId;
     private final int hostActionLifespanSeconds;
     private final String hostRedirectUri;
+    @Value("${vistay.keycloak.customer-client-id:vistay-customer-web}")
+    private String customerClientId = "vistay-customer-web";
+    @Value("${vistay.keycloak.customer-action-lifespan-seconds:900}")
+    private int customerActionLifespanSeconds = 900;
+    @Value("${vistay.keycloak.customer-redirect-uri:http://customer.localhost/oidc/callback}")
+    private String customerRedirectUri = "http://customer.localhost/oidc/callback";
     private final Map<String, CachedToken> cachedTokens = new ConcurrentHashMap<>();
 
     @Autowired
@@ -44,6 +53,9 @@ public class KeycloakAdminClient {
         @Value("${vistay.keycloak.backoffice-api-client-id:vistay-backoffice-api}") String backofficeApiClientId,
         @Value("${vistay.keycloak.backoffice-role-consumer-client-ids:vistay-backoffice-web,vistay-backoffice-mobile,vistay-backoffice-postman}")
         List<String> backofficeRoleConsumerClientIds,
+        @Value("${vistay.keycloak.backoffice-client-id:vistay-backoffice-web}") String backofficeClientId,
+        @Value("${vistay.keycloak.backoffice-action-lifespan-seconds:86400}") int backofficeActionLifespanSeconds,
+        @Value("${vistay.keycloak.backoffice-redirect-uri:http://admin.localhost/auth/callback}") String backofficeRedirectUri,
         @Value("${vistay.keycloak.host-realm:vistay-host}") String hostRealm,
         @Value("${vistay.keycloak.customer-realm:vistay-customer}") String customerRealm,
         @Value("${vistay.keycloak.host-client-id:vistay-host-web}") String hostClientId,
@@ -56,6 +68,9 @@ public class KeycloakAdminClient {
         this.clientSecret = clientSecret;
         this.backofficeApiClientId = backofficeApiClientId;
         this.backofficeRoleConsumerClientIds = List.copyOf(backofficeRoleConsumerClientIds);
+        this.backofficeClientId = backofficeClientId;
+        this.backofficeActionLifespanSeconds = backofficeActionLifespanSeconds;
+        this.backofficeRedirectUri = backofficeRedirectUri;
         this.hostRealm = hostRealm;
         this.customerRealm = customerRealm;
         this.hostClientId = hostClientId;
@@ -71,7 +86,8 @@ public class KeycloakAdminClient {
         String clientSecret
     ) {
         this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
-            defaultBackofficeRoleConsumers(),
+            defaultBackofficeRoleConsumers(), "vistay-backoffice-web", 86400,
+            "http://admin.localhost/auth/callback",
             "vistay-host", "vistay-customer", "vistay-host-web", 900,
             "http://host.localhost/oidc/callback");
     }
@@ -88,7 +104,8 @@ public class KeycloakAdminClient {
         String hostRedirectUri
     ) {
         this(builder, baseUrl, realm, clientId, clientSecret, "vistay-backoffice-api",
-            defaultBackofficeRoleConsumers(),
+            defaultBackofficeRoleConsumers(), "vistay-backoffice-web", 86400,
+            "http://admin.localhost/auth/callback",
             hostRealm, "vistay-customer", hostClientId, hostActionLifespanSeconds, hostRedirectUri);
     }
 
@@ -207,6 +224,20 @@ public class KeycloakAdminClient {
             .retrieve().toBodilessEntity();
     }
 
+    /** Projects the User-owned public registration switch to one portal realm. */
+    public void setRegistrationEnabled(String accountType, boolean enabled) {
+        var targetRealm = realmFor(accountType);
+        http.put()
+            .uri("/admin/realms/{realm}", targetRealm)
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of(
+                "registrationAllowed", enabled,
+                "verifyEmail", true
+            ))
+            .retrieve().toBodilessEntity();
+    }
+
     private String clientUuid(String targetRealm, String targetClientId) {
         var clients = http.get()
             .uri(uri -> uri.path("/admin/realms/{realm}/clients")
@@ -301,6 +332,65 @@ public class KeycloakAdminClient {
         }
     }
 
+    public String ensureBackofficeInvitedUser(
+        String email,
+        String fullName,
+        UUID invitationId
+    ) {
+        var existing = findExactUserByEmail(realm, email);
+        if (existing != null) {
+            return verifyBackofficeInvitedIdentity(existing, invitationId);
+        }
+
+        var name = splitName(fullName);
+        var representation = new UserRepresentation(
+            email,
+            email,
+            name.firstName(),
+            name.lastName(),
+            true,
+            false,
+            List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"),
+            List.of(),
+            Map.of(
+                "vistay_account_type", List.of("ADMIN"),
+                "vistay_invitation_id", List.of(invitationId.toString())
+            )
+        );
+
+        try {
+            var response = http.post()
+                .uri("/admin/realms/{realm}/users", realm)
+                .headers(headers -> headers.setBearerAuth(accessToken()))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(representation)
+                .retrieve()
+                .toBodilessEntity();
+            return subjectFromLocation(response.getHeaders().getLocation());
+        } catch (HttpClientErrorException.Conflict duplicate) {
+            var concurrent = findExactUserByEmail(realm, email);
+            if (concurrent != null) {
+                return verifyBackofficeInvitedIdentity(concurrent, invitationId);
+            }
+            throw duplicate;
+        }
+    }
+
+    public void sendBackofficeActivationEmail(String subject) {
+        http.put()
+            .uri(uri -> uri
+                .path("/admin/realms/{realm}/users/{userId}/execute-actions-email")
+                .queryParam("lifespan", backofficeActionLifespanSeconds)
+                .queryParam("client_id", backofficeClientId)
+                .queryParam("redirect_uri", backofficeRedirectUri)
+                .build(realm, subject))
+            .headers(headers -> headers.setBearerAuth(accessToken()))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"))
+            .retrieve()
+            .toBodilessEntity();
+    }
+
     public HostIdentity ensureHostUser(
         String email,
         String fullName,
@@ -362,6 +452,88 @@ public class KeycloakAdminClient {
             .body(List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"))
             .retrieve()
             .toBodilessEntity();
+    }
+
+    /** Creates an account for a known profile without bypassing the profile-link proof flow. */
+    public String ensureProfileAccount(
+        String accountType,
+        String email,
+        String fullName,
+        String temporaryPassword,
+        UUID requestId,
+        UUID targetProfileId
+    ) {
+        var targetRealm = realmFor(accountType);
+        var existing = findExactUserByEmail(targetRealm, email);
+        if (existing != null) {
+            var request = firstAttribute(existing.attributes(), "vistay_profile_account_request_id");
+            if (!requestId.toString().equals(request)) throw new ProfileAccountCollisionException();
+            return existing.id();
+        }
+
+        var invitation = temporaryPassword == null || temporaryPassword.isBlank();
+        var name = splitName(fullName);
+        var requiredActions = invitation
+            ? List.of("VERIFY_EMAIL", "UPDATE_PASSWORD")
+            : List.of("UPDATE_PASSWORD");
+        var credentials = invitation
+            ? List.<CredentialRepresentation>of()
+            : List.of(new CredentialRepresentation("password", temporaryPassword, true));
+        var representation = new UserRepresentation(
+            email, email, name.firstName(), name.lastName(), true, !invitation,
+            requiredActions, credentials,
+            Map.of(
+                "vistay_account_type", List.of(accountType),
+                "vistay_profile_account_request_id", List.of(requestId.toString()),
+                "vistay_target_profile_id", List.of(targetProfileId.toString())
+            )
+        );
+        try {
+            var response = http.post()
+                .uri("/admin/realms/{realm}/users", targetRealm)
+                .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(representation)
+                .retrieve().toBodilessEntity();
+            return subjectFromLocation(response.getHeaders().getLocation());
+        } catch (HttpClientErrorException.Conflict duplicate) {
+            var concurrent = findExactUserByEmail(targetRealm, email);
+            if (concurrent != null && requestId.toString().equals(firstAttribute(
+                concurrent.attributes(), "vistay_profile_account_request_id"))) {
+                return concurrent.id();
+            }
+            throw new ProfileAccountCollisionException();
+        }
+    }
+
+    public void sendProfileAccountActivationEmail(String accountType, String subject) {
+        var targetRealm = realmFor(accountType);
+        var client = switch (accountType) {
+            case "ADMIN" -> backofficeClientId;
+            case "HOST" -> hostClientId;
+            case "CUSTOMER" -> customerClientId;
+            default -> throw new IllegalArgumentException("Unsupported account type: " + accountType);
+        };
+        var lifespan = switch (accountType) {
+            case "ADMIN" -> backofficeActionLifespanSeconds;
+            case "HOST" -> hostActionLifespanSeconds;
+            case "CUSTOMER" -> customerActionLifespanSeconds;
+            default -> throw new IllegalArgumentException("Unsupported account type: " + accountType);
+        };
+        var redirect = switch (accountType) {
+            case "ADMIN" -> backofficeRedirectUri;
+            case "HOST" -> hostRedirectUri;
+            case "CUSTOMER" -> customerRedirectUri;
+            default -> throw new IllegalArgumentException("Unsupported account type: " + accountType);
+        };
+        http.put()
+            .uri(uri -> uri.path("/admin/realms/{realm}/users/{userId}/execute-actions-email")
+                .queryParam("lifespan", lifespan).queryParam("client_id", client)
+                .queryParam("redirect_uri", redirect).build(targetRealm, subject))
+            .headers(headers -> headers.setBearerAuth(accessToken(targetRealm)))
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(List.of("VERIFY_EMAIL", "UPDATE_PASSWORD"))
+            .retrieve().toBodilessEntity();
     }
 
     public HostActivationState hostActivationState(String subject) {
@@ -507,6 +679,14 @@ public class KeycloakAdminClient {
         return new HostIdentity(existing.id());
     }
 
+    private static String verifyBackofficeInvitedIdentity(UserSummary existing, UUID invitationId) {
+        var invitation = firstAttribute(existing.attributes(), "vistay_invitation_id");
+        if (!invitationId.toString().equals(invitation)) {
+            throw new BackofficeSubjectCollisionException();
+        }
+        return existing.id();
+    }
+
     private static String firstAttribute(Map<String, List<String>> attributes, String name) {
         if (attributes == null || attributes.get(name) == null || attributes.get(name).isEmpty()) {
             return null;
@@ -618,6 +798,12 @@ public class KeycloakAdminClient {
         Instant lastAccessAt,
         Map<String, String> clients
     ) {}
+
+    public static final class BackofficeSubjectCollisionException extends RuntimeException {
+        public BackofficeSubjectCollisionException() {
+            super("Backoffice email belongs to a different Keycloak identity");
+        }
+    }
     public record BruteForceStatus(
         boolean temporarilyLocked,
         int failureCount,
@@ -635,6 +821,12 @@ public class KeycloakAdminClient {
     public static final class HostSubjectCollisionException extends RuntimeException {
         public HostSubjectCollisionException() {
             super("HOST_SUBJECT_COLLISION");
+        }
+    }
+
+    public static final class ProfileAccountCollisionException extends RuntimeException {
+        public ProfileAccountCollisionException() {
+            super("PROFILE_ACCOUNT_ALREADY_EXISTS");
         }
     }
 }
