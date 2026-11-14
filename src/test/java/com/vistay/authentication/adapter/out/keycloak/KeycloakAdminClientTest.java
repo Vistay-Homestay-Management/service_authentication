@@ -75,6 +75,64 @@ class KeycloakAdminClientTest {
     }
 
     @Test
+    void createsInvitedEmployeeWithoutPasswordAndSendsRequiredActionsEmail() {
+        var builder = RestClient.builder();
+        var server = MockRestServiceServer.bindTo(builder).build();
+        var client = new KeycloakAdminClient(
+            builder, "http://identity.test", "vistay-backoffice",
+            "vistay-auth-facade", "test-secret"
+        );
+        var invitationId = UUID.randomUUID();
+        var subject = UUID.randomUUID();
+
+        expectServiceToken(server);
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users"))
+            .andExpect(method(HttpMethod.GET))
+            .andRespond(withSuccess("[]", MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> assertThat(request.getURI().getPath())
+                .isEqualTo("/admin/realms/vistay-backoffice/users"))
+            .andExpect(method(HttpMethod.POST))
+            .andExpect(content().json("""
+                {
+                  "username":"employee@vistay.test",
+                  "email":"employee@vistay.test",
+                  "enabled":true,
+                  "emailVerified":false,
+                  "requiredActions":["VERIFY_EMAIL","UPDATE_PASSWORD"],
+                  "credentials":[],
+                  "attributes":{
+                    "vistay_account_type":["ADMIN"],
+                    "vistay_invitation_id":["%s"]
+                  }
+                }
+                """.formatted(invitationId), JsonCompareMode.LENIENT))
+            .andRespond(withCreatedEntity(URI.create(
+                "http://identity.test/admin/realms/vistay-backoffice/users/" + subject
+            )));
+        server.expect(once(), request -> {
+                assertThat(request.getURI().getPath()).isEqualTo(
+                    "/admin/realms/vistay-backoffice/users/" + subject + "/execute-actions-email"
+                );
+                assertThat(request.getURI().getQuery()).contains(
+                    "lifespan=86400", "client_id=vistay-backoffice-web",
+                    "redirect_uri=http://admin.localhost/auth/callback"
+                );
+            })
+            .andExpect(method(HttpMethod.PUT))
+            .andExpect(content().json("[\"VERIFY_EMAIL\",\"UPDATE_PASSWORD\"]"))
+            .andRespond(withSuccess());
+
+        var actual = client.ensureBackofficeInvitedUser(
+            "employee@vistay.test", "ViStay Employee", invitationId
+        );
+        client.sendBackofficeActivationEmail(actual);
+
+        assertThat(actual).isEqualTo(subject.toString());
+        server.verify();
+    }
+
+    @Test
     void reusesExistingKeycloakUserWhenRepairingAPartialProvisioningAttempt() {
         var builder = RestClient.builder();
         var server = MockRestServiceServer.bindTo(builder).build();
