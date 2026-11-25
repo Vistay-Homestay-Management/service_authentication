@@ -19,7 +19,8 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                checkout([
+                script {
+                    def checkoutVars = checkout([
                     $class: 'GitSCM',
                     branches: scm.branches,
                     doGenerateSubmoduleConfigurations: false,
@@ -32,7 +33,9 @@ pipeline {
                         trackingSubmodules: false
                     ]],
                     userRemoteConfigs: scm.userRemoteConfigs
-                ])
+                    ])
+                    env.GIT_BRANCH = checkoutVars.GIT_BRANCH ?: ''
+                }
             }
         }
 
@@ -80,7 +83,7 @@ pipeline {
                             --env SONAR_HOST_URL \
                             --env SONAR_TOKEN \
                             eclipse-temurin:21-jdk-jammy \
-                            sh -ec 'sh ./gradlew classes testClasses sonar -x test --no-daemon'
+                            sh -ec 'sh ./gradlew classes testClasses sonar -x test --no-daemon --stacktrace'
                     '''
                 }
             }
